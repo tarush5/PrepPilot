@@ -1,0 +1,21 @@
+{
+  "name": "preppilot",
+  "version": "1.0.0",
+  "description": "PrepPilot — AI Interview Coach & ATS Analyzer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "interview",
+    "ai",
+    "ats",
+    "coaching"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.127.0"
+  }
+}
