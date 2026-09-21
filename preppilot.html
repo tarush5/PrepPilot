@@ -644,6 +644,32 @@ hr.sep{border:0;border-top:1px solid var(--line);margin:22px 0}
   transition:transform .25s var(--spring),box-shadow .25s;
 }
 .vtl button:hover{transform:translateY(-3px);box-shadow:var(--glow)}
+.vtl button.now{outline:2px solid var(--text);outline-offset:2px}
+
+/* the attention strip: one picture of where the eye contact went */
+.vstrip{
+  width:100%;height:104px;display:block;border-radius:12px;overflow:hidden;
+  border:1px solid var(--line);cursor:pointer;background:var(--surface-2);
+}
+.vstrip .seg{opacity:.9}
+.vstrip-wrap{margin-top:20px;padding-top:16px;border-top:1px solid var(--line-soft)}
+.vscale{display:flex;justify-content:space-between;margin-top:5px;font-size:11px;color:var(--text-dim);font-family:"JetBrains Mono",monospace}
+.vlegend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--text-dim)}
+.vlegend span{display:inline-flex;align-items:center;gap:5px}
+.vlegend i{width:10px;height:10px;border-radius:3px;display:inline-block}
+.vraw{margin-top:14px;padding-top:12px;border-top:1px solid var(--line-soft)}
+.vraw summary{cursor:pointer}
+
+/* live meters in the camera tile — eye contact, framing, light */
+.cam-badge .meters{display:flex;gap:3px;margin-bottom:3px}
+.cam-badge .meters .m{
+  flex:1;height:3px;border-radius:99px;background:var(--line);position:relative;overflow:hidden;
+}
+.cam-badge .meters .m::after{
+  content:"";position:absolute;inset:0 auto 0 0;width:var(--v);background:var(--c);
+  border-radius:99px;transition:width .3s var(--ease),background .3s;
+}
+.cam-badge b{display:block;font-weight:700}
 
 /* ---------- misc ---------- */
 .toast{
@@ -3423,29 +3449,65 @@ Only disagree if the policy choice would clearly waste the candidate's remaining
 /* ---------------------------------------------------------------
    10c · video — camera capture and on-device presence analysis
    ---------------------------------------------------------------
-   Two engines. The built-in one needs no network and no libraries: it works on
-   a 160x120 downscale, segments skin tone in YCbCr, and derives framing, head
-   stability, motion energy and lighting from the mask. If MediaPipe's face
-   landmarker loads, it upgrades gaze, blink and smile to real measurements and
-   the report says which engine produced the numbers.
+   Two engines, and the split between them is about what each one is actually
+   good at rather than one being a fallback for the other.
+
+   · The pixel engine needs no network and no libraries. It works on a 160x120
+     downscale, segments skin tone in YCbCr, and derives framing, exposure and
+     motion energy from the mask. Lighting is the thing it measures *well* —
+     clipping is clipping no matter what else is in the frame.
+
+   · The landmark engine (MediaPipe face mesh, loaded in the background) gives
+     real face geometry: eye-corner positions, nose tip, chin, plus blendshapes
+     for gaze, blink and smile. When it is live it takes over everything
+     geometric — framing, stillness, head pose — because a skin mask cannot
+     tell a face from a wooden door, and the pixel pass drops to 3Hz to do
+     nothing but watch the exposure.
+
+   Head pose is derived from landmark geometry, not from the transformation
+   matrix: the matrix's row/column convention is easy to get backwards and the
+   error is silent, while eye-corner and nose-tip ratios are unambiguous.
+
    Frames are analysed in memory and the recording stays in this tab.
 --------------------------------------------------------------- */
+
+/* Canonical MediaPipe face-mesh indices used for pose. These are anatomical:
+   33 is the outer corner of the subject's right eye whichever way the picture
+   is mirrored on screen. */
+const LM = { eyeR: 33, eyeL: 263, nose: 1, chin: 152, brow: 10 };
+
 const Video = {
   enabled: false, ready: false, engine: "none",
   stream: null, videoEl: null, canvas: null, ctx: null,
   recorder: null, chunks: [], blobUrl: null, recStart: 0,
-  landmarker: null,
+  landmarker: null, lmTime: 0, lmFail: 0,
   samples: [],          // every analysed frame for the whole session
   segment: null,        // the slice belonging to the current question
-  timer: null, lastFrame: null, lastTick: 0,
+  timer: null, lastFrame: null, lastFrameT: 0, tick: 0,
   awaySince: null, awayCount: 0, awayMs: 0,
-  FPS: 8, W: 160, H: 120,
+  lastPix: null,        // cached exposure block, refreshed at PIX_HZ
+  pauses: [],           // {t0,t1} on the sample clock, cut out of the recording
+  cost: 0,              // EMA of milliseconds spent per analysed frame
+  hud: { gaze: 0, frame: 0, light: 0, hint: "", hintAt: 0, seeded: false, since: 0 },
+  W: 160, H: 120,
+
+  /* Sampling rates. The landmark pass is GPU work and cheap enough to run near
+     blink speed; the pixel pass is a 19k-pixel JS loop and only needs to keep
+     up with the lighting in the room. Without landmarks the pixel pass *is*
+     the analysis, so it runs at the full base rate. */
+  FPS_LM: 15, FPS_PIX: 8, PIX_HZ: 3,
+  fps: 8,
+
+  /* Blink lasts 100–150ms. At the old 8fps a blink fell between two samples
+     more often than not, every candidate was told they had an "unusually low
+     blink rate", and the advice that followed was noise. 15fps is the floor
+     that makes the measurement mean anything. */
 
   async start() {
     if (this.ready) return true;
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" },
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 }, facingMode: "user" },
         audio: true,
       });
     } catch (e) {
@@ -3465,10 +3527,10 @@ const Video = {
 
     this.canvas = document.createElement("canvas");
     this.canvas.width = this.W; this.canvas.height = this.H;
-    this.ctx = this.canvas.getContext("2d", { willReadFrequently: true });
+    this.ctx = this.canvas.getContext("2d", { willReadFrequently: true, alpha: false });
 
-    this.samples = []; this.lastFrame = null;
-    this.engine = "builtin";
+    this.samples = []; this.pauses = []; this.lastFrame = null; this.lastFrameT = 0; this.lastPix = null; this.tick = 0;
+    this.engine = "builtin"; this.fps = this.FPS_PIX;
     this.ready = true;
     this.startRecording();
     this.loop();
@@ -3489,66 +3551,120 @@ const Video = {
     } catch { this.recorder = null; }
   },
 
-  /** Optional: real landmarks. Failure here is silent and the built-in engine stays. */
+  /** Optional: real landmarks. Failure here is silent and the pixel engine stays. */
   async loadLandmarker() {
+    const make = async (vision, files, delegate) => vision.FaceLandmarker.createFromOptions(files, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate,
+      },
+      outputFaceBlendshapes: true,
+      /* The transformation matrix is not requested: pose comes from landmark
+         geometry instead, and not computing it saves work every frame. */
+      outputFacialTransformationMatrixes: false,
+      runningMode: "VIDEO",
+      numFaces: 1,
+      minFaceDetectionConfidence: 0.4,
+      minFacePresenceConfidence: 0.4,
+      minTrackingConfidence: 0.4,
+    });
     try {
       const vision = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs");
       const files = await vision.FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
-      this.landmarker = await vision.FaceLandmarker.createFromOptions(files, {
-        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
-        outputFaceBlendshapes: true,
-        outputFacialTransformationMatrixes: true,
-        runningMode: "VIDEO",
-        numFaces: 1,
-      });
+      // A machine without a usable WebGL context still runs this on the CPU.
+      try { this.landmarker = await make(vision, files, "GPU"); }
+      catch { this.landmarker = await make(vision, files, "CPU"); }
+      if (!this.ready) { this.landmarker.close?.(); return; }   // interview ended while loading
       this.engine = "landmarks";
-      toast("Face landmarks loaded — gaze and expression are now measured directly.");
-    } catch { /* built-in engine is already running */ }
+      this.fps = this.FPS_LM;
+      this.loop();                                             // re-arm at the faster cadence
+      toast("Face landmarks loaded — gaze, blink and posture are now measured directly.");
+    } catch { /* pixel engine is already running */ }
   },
 
   /* Driven by a timer, not requestAnimationFrame: rAF is suspended entirely in
      a background tab, so an alt-tab mid-interview used to stop the analysis
      without a trace and leave the report looking clean. A timer keeps firing,
-     and leaving the interview is recorded as what it is — an away period. */
+     and leaving the interview is recorded as what it is — an away period.
+
+     The chain re-schedules itself rather than using setInterval so a slow
+     frame delays the next one instead of stacking up behind it, and so the
+     rate can be lowered on a machine that cannot keep up. */
   loop() {
-    clearInterval(this.timer);
-    this.timer = setInterval(() => {
-      const now = performance.now();
-      if (document.hidden) { this.markAway(now); return; }
-      if (!this.videoEl || this.videoEl.readyState < 2) return;
-      try { this.sample(now); } catch { /* never let a bad frame kill the loop */ }
-    }, 1000 / this.FPS);
+    clearTimeout(this.timer);
+    const step = () => {
+      const started = performance.now();
+      if (document.hidden) this.markAway(started);
+      else if (this.videoEl && this.videoEl.readyState >= 2) {
+        try { this.sample(started); } catch { /* never let a bad frame kill the loop */ }
+      }
+      const spent = performance.now() - started;
+      this.cost = this.cost ? this.cost * 0.85 + spent * 0.15 : spent;
+
+      /* Back off if analysis is eating the frame budget. The interview is also
+         running speech synthesis and a WebGL avatar; a stuttering interviewer
+         costs the candidate more than two extra samples per second gain. */
+      let fps = this.engine === "landmarks" ? this.FPS_LM : this.FPS_PIX;
+      if (this.cost > 1000 / fps * 0.55) fps = Math.max(5, fps / 2);
+      this.fps = fps;
+
+      const wait = Math.max(4, 1000 / fps - spent);
+      if (this.ready) this.timer = setTimeout(step, wait);
+    };
+    this.timer = setTimeout(step, 1000 / this.fps);
   },
 
   markAway(now) {
     if (this.awaySince === null) { this.awaySince = now; this.awayCount++; }
     const s = { t: now - this.recStart, away: true, face: false, engine: this.engine,
                 brightness: 0, contrast: 0, motion: 0, faceArea: 0, cx: .5, cy: .5,
-                symmetry: 0, gaze: null, blink: null, smile: null, yaw: null, pitch: null };
+                symmetry: 0, gaze: null, blink: null, smile: null, yaw: null, pitch: null,
+                roll: null, gx: null, gy: null };
     this.samples.push(s);
     if (this.segment) this.segment.samples.push(s);
   },
 
   sample(now) {
     if (this.awaySince !== null) { this.awayMs += now - this.awaySince; this.awaySince = null; }
-    this.ctx.drawImage(this.videoEl, 0, 0, this.W, this.H);
-    const img = this.ctx.getImageData(0, 0, this.W, this.H);
-    const s = this.engine === "landmarks" && this.landmarker
-      ? this.analyseLandmarks(img, now)
-      : this.analysePixels(img);
+    this.tick++;
+
+    const onLandmarks = this.engine === "landmarks" && this.landmarker;
+    /* With landmarks live, exposure is the only thing the pixel loop is still
+       needed for, and exposure changes at the speed of a cloud crossing a
+       window — 3Hz is plenty. The saving is small in absolute terms (the frame
+       grab and the 19k-pixel loop together cost about a third of a millisecond,
+       against roughly 20ms for one mesh inference); what it buys is that
+       raising the sample rate from 8Hz to 15Hz for blink detection does not
+       drag the pixel work up with it. */
+    const pixEvery = onLandmarks ? Math.max(1, Math.round(this.fps / this.PIX_HZ)) : 1;
+    const doPix = !this.lastPix || this.tick % pixEvery === 0;
+
+    let s;
+    if (doPix) {
+      this.ctx.drawImage(this.videoEl, 0, 0, this.W, this.H);
+      const img = this.ctx.getImageData(0, 0, this.W, this.H);
+      s = this.analysePixels(img);
+      this.lastPix = s;
+    } else {
+      // carry the cached exposure/motion block forward, cheaply
+      s = { ...this.lastPix };
+    }
+
+    if (onLandmarks) s = this.analyseLandmarks(s, now);
+
     s.t = now - this.recStart;
     this.samples.push(s);
     if (this.segment) this.segment.samples.push(s);
     this.renderLiveBadge(s);
   },
 
-  /* --- built-in engine: skin-mask geometry, no dependencies --- */
+  /* --- pixel engine: skin-mask geometry and exposure, no dependencies --- */
   analysePixels(img) {
     const d = img.data, W = this.W, H = this.H;
     let lumaSum = 0, lumaSqSum = 0, skin = 0, skinLuma = 0, crushed = 0, blown = 0;
     let minX = W, maxX = 0, minY = H, maxY = 0, cx = 0, cy = 0;
     const colSum = new Uint16Array(W);
-    let diff = 0;
+    let diffSigned = 0;
     const prev = this.lastFrame;
     const gray = new Uint8Array(W * H);
 
@@ -3557,7 +3673,7 @@ const Video = {
       const y = 0.299 * r + 0.587 * g + 0.114 * b;
       gray[p] = y;
       lumaSum += y; lumaSqSum += y * y;
-      if (prev) diff += Math.abs(y - prev[p]);
+      if (prev) { const dy = y - prev[p]; diffSigned += dy; }
 
       // YCbCr skin gate — stable across skin tones because it keys on
       // chrominance, not brightness
@@ -3584,17 +3700,38 @@ const Video = {
         if (yy < minY) minY = yy; if (yy > maxY) maxY = yy;
       }
     }
-    this.lastFrame = gray;
 
     const n = W * H;
     const meanLuma = lumaSum / n;
+
+    /* Motion, with the exposure drift taken out. A webcam's auto-gain lifts or
+       drops every pixel at once when a cloud passes or you lean toward the
+       screen; raw frame difference counts that as the candidate fidgeting.
+       Subtracting the mean shift per pixel leaves only the part of the change
+       that is actually something moving.
+
+       Normalised to a fixed 125ms window, because the pixel pass now runs at
+       3Hz behind the landmarker and at 8Hz without it: an un-normalised frame
+       difference is simply larger when the gap between frames is longer, and
+       would have reported every candidate as restless the moment the face mesh
+       finished loading. */
+    let motion = 0;
+    const nowT = performance.now();
+    if (prev) {
+      const shift = diffSigned / n;
+      for (let p = 0; p < n; p++) motion += Math.abs(gray[p] - prev[p] - shift);
+      const gap = clamp((nowT - this.lastFrameT) / 1000, 0.03, 1);
+      motion = motion / n * (0.125 / gap);
+    }
+    this.lastFrame = gray;
+    this.lastFrameT = nowT;
+
     const sd = Math.sqrt(Math.max(0, lumaSqSum / n - meanLuma * meanLuma));
-    const motion = prev ? diff / n : 0;
     const skinFrac = skin / n;
     const faceFound = skin > n * 0.012;
 
     let out = {
-      face: faceFound, engine: "builtin",
+      face: faceFound, engine: "builtin", lmFace: false,
       /* Lighting is judged on the face, not the room: a dark wall behind you
          is not the same problem as a dark face, and only one of them is worth
          telling the candidate about. */
@@ -3605,7 +3742,9 @@ const Video = {
       contrast: +(sd / 128).toFixed(3),
       motion: +(motion / 32).toFixed(3),
       faceArea: +skinFrac.toFixed(3),
-      cx: 0.5, cy: 0.5, symmetry: 0, gaze: null, blink: null, smile: null, yaw: null, pitch: null,
+      cx: 0.5, cy: 0.5, symmetry: 0,
+      gaze: null, blink: null, smile: null, yaw: null, pitch: null, roll: null,
+      gx: null, gy: null, scale: null,
     };
     if (!faceFound) return out;
 
@@ -3627,52 +3766,179 @@ const Video = {
     return out;
   },
 
-  /* --- upgraded engine: real landmarks --- */
-  analyseLandmarks(img, now) {
-    const base = this.analysePixels(img);
+  /* --- landmark engine: real face geometry and expression --- */
+  analyseLandmarks(base, now) {
     let res;
-    try { res = this.landmarker.detectForVideo(this.videoEl, now); } catch { return base; }
+    // detectForVideo rejects a timestamp that does not advance.
+    const ts = Math.max(Math.round(now), this.lmTime + 1);
+    this.lmTime = ts;
+    try { res = this.landmarker.detectForVideo(this.videoEl, ts); }
+    catch {
+      /* Three consecutive throws means the GPU context is gone (a laptop lid,
+         a driver reset). Drop back rather than throwing once per frame for the
+         rest of the interview. */
+      if (++this.lmFail > 3) { this.engine = "builtin"; this.landmarker = null; this.loop(); }
+      return { ...base, engine: "landmarks" };
+    }
+    this.lmFail = 0;
+
+    const pts = res?.faceLandmarks?.[0];
+    const shapes = res?.faceBlendshapes?.[0]?.categories;
     /* When the landmarker can't lock on — bad light, steep angle, partial
        occlusion — the pixel engine's framing and lighting readings are still
        valid. Keep them and leave only the landmark-derived fields null, rather
        than reporting the frame as "no face" and telling the candidate they
        were off camera when they weren't. */
-    const shapes = res?.faceBlendshapes?.[0]?.categories;
-    if (!shapes || !shapes.length) return { ...base, engine: "landmarks" };
+    if (!pts || !shapes?.length) return { ...base, engine: "landmarks" };
 
-    const v = name => shapes.find(c => c.categoryName === name)?.score ?? 0;
-    const lookIn = (v("eyeLookInLeft") + v("eyeLookInRight")) / 2;
-    const lookOut = (v("eyeLookOutLeft") + v("eyeLookOutRight")) / 2;
-    const lookUp = (v("eyeLookUpLeft") + v("eyeLookUpRight")) / 2;
-    const lookDown = (v("eyeLookDownLeft") + v("eyeLookDownRight")) / 2;
+    /* One pass into a map instead of a linear scan per blendshape: the model
+       returns ~52 categories and this used to cost twelve scans a frame. */
+    const B = this.shapeMap || (this.shapeMap = new Map());
+    B.clear();
+    for (let i = 0; i < shapes.length; i++) B.set(shapes[i].categoryName, shapes[i].score);
+    const v = k => B.get(k) || 0;
+
+    // --- geometry -------------------------------------------------------
+    /* Normalised landmark y is relative to frame height and x to frame width,
+       so on a 4:3 frame a vertical distance and a horizontal one are not in
+       the same unit. Rescale y into x-units before any distance or angle. */
+    const ar = (this.videoEl.videoHeight || 3) / (this.videoEl.videoWidth || 4);
+    const P = i => ({ x: pts[i].x, y: pts[i].y * ar });
+    const eR = P(LM.eyeR), eL = P(LM.eyeL), nose = P(LM.nose), chin = P(LM.chin), brow = P(LM.brow);
+    const eyeMid = { x: (eR.x + eL.x) / 2, y: (eR.y + eL.y) / 2 };
+    const eyeDist = Math.hypot(eL.x - eR.x, eL.y - eR.y) || 1e-4;
+
+    /* Yaw, as how far the nose tip sits off the midpoint of the eye line —
+       measured *along* that line rather than as raw distance, so a tilted head
+       does not read as a turned one. Square to the camera the nose sits on the
+       perpendicular bisector; turned, it slides toward the near eye. Dividing
+       by the eye separation makes it a ratio of two lengths on the same face,
+       so it survives the candidate sitting closer or the frame's aspect. */
+    const ux = (eL.x - eR.x) / eyeDist, uy = (eL.y - eR.y) / eyeDist;
+    const along = (nose.x - eyeMid.x) * ux + (nose.y - eyeMid.y) * uy;
+    const yawRatio = clamp(along / (eyeDist * 0.84), -1, 1);   // -1 … 1, 0 = square on
+    const yaw = +(Math.asin(clamp(yawRatio * 1.7, -1, 1)) * 180 / Math.PI).toFixed(1);
+
+    /* Pitch, as foreshortening: brow-to-eyes against eyes-to-chin. Chin down
+       stretches the upper span and collapses the lower one. Reported as a raw
+       ratio; the session's own median becomes the neutral, because the neutral
+       value of this ratio is a fact about a person's face, not their posture. */
+    const upper = Math.abs(eyeMid.y - brow.y), lower = Math.abs(chin.y - eyeMid.y) || 1e-4;
+    const pitchRatio = upper / lower;
+    const pitch = +(pitchRatio).toFixed(3);
+
+    // Head tilt, straight off the eye line. Unambiguous and worth reporting.
+    const roll = +(Math.atan2(eL.y - eR.y, eL.x - eR.x) * 180 / Math.PI).toFixed(1);
+
+    /* Framing from the landmark hull rather than the skin mask: a wooden door,
+       a hand, or a tan jacket all pass the chroma gate and used to inflate
+       "face area". Face width against frame width is the honest measure. */
+    const scale = eyeDist / 0.14;                 // 1.0 ≈ a well-framed head
+    // Outer eye corners span about 45% of face width; a head is ~1.4x as tall
+    // as it is wide. Both spans back in frame-relative units.
+    const faceW = clamp(eyeDist / 0.45, 0, 1);
+    const faceArea = clamp(faceW * (faceW * 1.4 / (ar || 0.75)), 0, 1);
+    const cx = eyeMid.x, cy = eyeMid.y / (ar || 1);
+
+    // --- gaze -----------------------------------------------------------
+    /* Pair the eyes anatomically. Looking left means the left eye looks *out*
+       and the right eye looks *in*; averaging all four "out" scores together,
+       as this used to, halved every sideways glance and let real ones pass as
+       eye contact. */
+    const lookL = (v("eyeLookOutLeft") + v("eyeLookInRight")) / 2;
+    const lookR = (v("eyeLookInLeft") + v("eyeLookOutRight")) / 2;
+    const lookU = (v("eyeLookUpLeft") + v("eyeLookUpRight")) / 2;
+    const lookD = (v("eyeLookDownLeft") + v("eyeLookDownRight")) / 2;
+    const gx = lookL - lookR;                     // signed: + is toward their left
+    const gy = lookU - lookD;                     // signed: + is up
     const blinkAmt = (v("eyeBlinkLeft") + v("eyeBlinkRight")) / 2;
     const smile = (v("mouthSmileLeft") + v("mouthSmileRight")) / 2;
 
-    // head pose from the transformation matrix (column-major 4x4)
-    let yaw = null, pitch = null;
-    const m = res.facialTransformationMatrixes?.[0]?.data;
-    if (m) {
-      yaw = +(Math.atan2(-m[8], Math.hypot(m[9], m[10])) * 180 / Math.PI).toFixed(1);
-      pitch = +(Math.atan2(m[9], m[10]) * 180 / Math.PI).toFixed(1);
-    }
+    /* Everyone looks at the interviewer's face on screen, which sits below the
+       lens — a small downward offset is what good eye contact actually looks
+       like on a video call, so it gets a dead zone and a lighter weight than
+       looking away sideways. */
+    const hx = Math.max(0, Math.abs(gx) - 0.05);
+    const hy = gy < 0 ? Math.max(0, -gy - 0.16) : Math.max(0, gy - 0.06);
+    const eyeOff = Math.hypot(hx * 1.15, hy * 0.8);
 
-    // eye contact: eyes near centre AND head roughly square to the camera
-    const eyeOff = Math.max(lookOut, lookDown * 0.9, lookUp * 0.7, lookIn * 0.6);
-    const headOff = yaw === null ? 0 : clamp(Math.abs(yaw) / 28, 0, 1) * 0.6 + clamp(Math.abs(pitch) / 24, 0, 1) * 0.4;
-    const gaze = clamp(1 - eyeOff * 1.35 - headOff * 0.7, 0, 1);
+    /* The blendshape eyeLook scores say where the eyes point *inside the head*,
+       so where the candidate is actually looking is the head direction plus the
+       eye direction, and the two terms add. The head gets the same courtesy the
+       eyes do — a few degrees off square is just how a laptop sits on a desk —
+       but past that it has to be able to sink the score on its own. Eyes
+       perfectly centred in a head turned thirty degrees away is not eye
+       contact, and weighting the head too lightly used to score exactly that
+       at 66%. */
+    const headOff = clamp((Math.abs(yawRatio) - 0.04) / 0.26, 0, 1);
 
-    return { ...base, face: true, engine: "landmarks",
-      gaze: +gaze.toFixed(3), blink: +blinkAmt.toFixed(3), smile: +smile.toFixed(3),
-      yaw, pitch };
+    /* Lids closing drives every eyeLook score to zero, so a blink used to read
+       as a perfect moment of eye contact. Blinking frames carry no gaze. */
+    const blinking = blinkAmt > 0.45;
+    const gaze = blinking ? null : clamp(1 - eyeOff * 1.5 - headOff * 0.95, 0, 1);
+
+    return {
+      ...base, face: true, lmFace: true, engine: "landmarks",
+      gaze: gaze === null ? null : +gaze.toFixed(3),
+      blink: +blinkAmt.toFixed(3), smile: +smile.toFixed(3),
+      gx: +gx.toFixed(3), gy: +gy.toFixed(3),
+      yaw, pitch, roll, scale: +scale.toFixed(3),
+      faceArea: +faceArea.toFixed(3), cx: +cx.toFixed(3), cy: +cy.toFixed(3),
+    };
   },
 
+  /* The tile is the only feedback a candidate gets while it still matters.
+     Three meters and one short, slow-changing nudge — anything busier competes
+     with the question they are trying to answer. */
   renderLiveBadge(s) {
     const b = $("#camBadge");
     if (!b) return;
-    if (!s.face) { b.textContent = "no face"; b.dataset.k = "bad"; return; }
-    const g = s.gaze !== null ? s.gaze : s.symmetry;
-    b.textContent = s.gaze !== null ? `eye contact ${Math.round(g * 100)}%` : `facing camera ${Math.round(g * 100)}%`;
-    b.dataset.k = g > 0.62 ? "good" : g > 0.4 ? "ok" : "bad";
+    const H = this.hud;
+    /* The meters are smoothed, but they must not smooth *up from zero* on the
+       first frame: a tile that opens on three empty bars reads as a failure,
+       and the hint logic below would latch onto it. The first measurement is
+       taken as-is and the easing starts from there. */
+    const ease = (a, x) => H.seeded ? a + (x - a) * 0.25 : x;
+
+    if (!s.face) {
+      H.gaze = ease(H.gaze, 0);
+      b.dataset.k = "bad";
+      b.innerHTML = `<b>off camera</b>`;
+      return;
+    }
+    const g = s.gaze !== null ? s.gaze : (s.lmFace ? H.gaze : s.symmetry);
+    H.gaze = ease(H.gaze, g);
+
+    // framing: size right and roughly centred
+    const sc = s.scale, offX = Math.abs(s.cx - 0.5);
+    const sizeOk = sc !== null ? clamp(1 - Math.abs(sc - 1) * 1.6, 0, 1)
+                               : (s.faceArea > 0.045 && s.faceArea < 0.3 ? 1 : 0.3);
+    H.frame = ease(H.frame, clamp(sizeOk * 0.65 + (1 - clamp(offX * 3.4, 0, 1)) * 0.35, 0, 1));
+
+    const under = Math.max(s.crushed || 0, (s.faceBrightness ?? 1) < 0.17 ? 0.45 : 0);
+    H.light = ease(H.light, clamp(1 - under * 2.2 - (s.blown || 0) * 2.6, 0, 1));
+
+    const now = performance.now();
+    if (!H.seeded) { H.seeded = true; H.since = now; }
+
+    /* One nudge at a time. A new one waits out a four-second hold so the tile
+       does not flicker between complaints while the webcam's auto-exposure is
+       still settling; a nudge whose problem has been fixed disappears at once,
+       because leaving it up after the candidate has acted on it is worse than
+       saying nothing. Nothing is shown at all for the first two seconds. */
+    const worst = now - H.since < 2000 ? ""
+      : H.light < 0.45 ? "more light on your face"
+      : H.frame < 0.45 ? (sc !== null && sc < 0.8 ? "come closer" : sc !== null && sc > 1.3 ? "sit back a little" : "centre yourself")
+      : H.gaze < 0.42 ? "look at the lens"
+      : "";
+    if (worst !== H.hint && (!worst || now - H.hintAt > 4000)) { H.hint = worst; H.hintAt = now; }
+
+    const bar = (val, label) =>
+      `<i class="m" style="--v:${Math.round(val * 100)}%;--c:${val > .62 ? "#6EE7B7" : val > .4 ? "#FBBF24" : "#FCA5A5"}" title="${label}"></i>`;
+    b.dataset.k = H.gaze > 0.62 ? "good" : H.gaze > 0.4 ? "ok" : "bad";
+    b.innerHTML =
+      `<span class="meters">${bar(H.gaze, "eye contact")}${bar(H.frame, "framing")}${bar(H.light, "lighting")}</span>` +
+      `<b>${H.hint || (s.gaze !== null ? `eye contact ${Math.round(H.gaze * 100)}%` : `facing camera ${Math.round(H.gaze * 100)}%`)}</b>`;
   },
 
   openSegment(idx, q) {
@@ -3682,13 +3948,34 @@ const Video = {
   pauseSampling() {
     if (!this.ready) return;
     this.sealSegment();
-    clearInterval(this.timer); this.timer = null;
+    clearTimeout(this.timer); this.timer = null;
+    this.pauses.push({ t0: performance.now() - this.recStart, t1: null });
     try { this.recorder?.state === "recording" && this.recorder.pause(); } catch {}
   },
   resumeSampling() {
     if (!this.ready) return;
+    const last = this.pauses.at(-1);
+    if (last && last.t1 === null) last.t1 = performance.now() - this.recStart;
     try { this.recorder?.state === "paused" && this.recorder.resume(); } catch {}
     this.loop();
+  },
+
+  /* Sample clock to recording clock. The recorder stops while the candidate has
+     the interview paused; performance.now() does not. Every timestamp the
+     report hands to the player — the strip, the per-question cells, the jump to
+     the worst moment — has to come through here, or a single two-minute break
+     puts every seek two minutes past the thing it was pointing at. */
+  mediaTime(t) {
+    let off = 0;
+    for (const p of this.pauses) {
+      if (p.t0 >= t) break;
+      off += Math.min(p.t1 ?? t, t) - p.t0;
+    }
+    return Math.max(0, t - off);
+  },
+  mediaDuration() {
+    const last = this.samples.at(-1);
+    return last ? this.mediaTime(last.t) : 0;
   },
   sealSegment() {
     if (!this.segment) return null;
@@ -3699,8 +3986,34 @@ const Video = {
     return { idx: seg.idx, t0: Math.round(seg.t0), t1: Math.round(t1), ...summarise(seg.samples) };
   },
 
+  /** A coarse, evenly-spaced series for the report's timeline strip. */
+  series(buckets = 220) {
+    const S = this.samples;
+    if (!S.length) return [];
+    /* Bucketed on recording time, so the strip lines up with the player and a
+       paused stretch closes up instead of leaving a hole that reads as a
+       lapse. */
+    const mt = S.map(s => this.mediaTime(s.t));
+    const t0 = mt[0], t1 = mt.at(-1), span = Math.max(1, t1 - t0);
+    const out = Array.from({ length: buckets }, () => ({ g: 0, n: 0, away: 0, off: 0, m: 0 }));
+    S.forEach((s, i) => {
+      const b = out[Math.min(buckets - 1, Math.floor((mt[i] - t0) / span * buckets))];
+      if (s.away) { b.away++; return; }
+      b.m++;
+      if (!s.face) { b.off++; return; }
+      const g = s.gaze !== null ? s.gaze : s.symmetry;
+      b.g += g; b.n++;
+    });
+    return out.map((b, i) => ({
+      t: (t0 + span * (i + 0.5) / buckets) / 1000,
+      g: b.n ? b.g / b.n : null,
+      away: b.away > 0 && b.away >= b.m,
+      off: b.m > 0 && b.off > b.m / 2,
+    }));
+  },
+
   async stop() {
-    clearInterval(this.timer); this.timer = null;
+    clearTimeout(this.timer); this.timer = null;
     if (this.awaySince !== null) { this.awayMs += performance.now() - this.awaySince; this.awaySince = null; }
     if (this.recorder && this.recorder.state !== "inactive") {
       await new Promise(res => { this.recorder.onstop = res; try { this.recorder.stop(); } catch { res(); } });
@@ -3717,14 +4030,23 @@ const Video = {
   releaseCamera() {
     try { this.stream?.getVideoTracks().forEach(t => t.stop()); } catch {}
     if (this.videoEl) this.videoEl.srcObject = null;
+    // The face mesh holds a GPU context and a few MB of weights; a finished
+    // interview has no use for either.
+    try { this.landmarker?.close?.(); } catch {}
+    this.landmarker = null;
   },
 
   reset() {
     try { this.stream?.getTracks().forEach(t => t.stop()); } catch {}
     if (this.blobUrl) { try { URL.revokeObjectURL(this.blobUrl); } catch {} }
-    clearInterval(this.timer); this.timer = null;
+    clearTimeout(this.timer); this.timer = null;
+    try { this.landmarker?.close?.(); } catch {}
+    this.landmarker = null; this.engine = "none"; this.lmFail = 0; this.lmTime = 0;
     this.stream = null; this.blobUrl = null; this.chunks = [];
-    this.samples = []; this.segment = null; this.lastFrame = null; this.ready = false;
+    this.samples = []; this.segment = null; this.pauses = [];
+    this.lastFrame = null; this.lastFrameT = 0; this.lastPix = null;
+    this.ready = false; this.cost = 0; this.tick = 0;
+    this.hud = { gaze: 0, frame: 0, light: 0, hint: "", hintAt: 0, seeded: false, since: 0 };
     this.awaySince = null; this.awayCount = 0; this.awayMs = 0;
   },
 };
@@ -3744,19 +4066,93 @@ function summarise(all) {
     const m = avg(arr, f);
     return Math.sqrt(arr.reduce((a, s) => a + (f(s) - m) ** 2, 0) / arr.length);
   };
+  const med = (arr, f) => {
+    if (!arr.length) return 0;
+    const v = arr.map(f).sort((a, b) => a - b);
+    return v[v.length >> 1];
+  };
 
-  const hasGaze = seen.some(s => s.gaze !== null);
-  const gaze = hasGaze ? avg(seen.filter(s => s.gaze !== null), s => s.gaze) : avg(seen, s => s.symmetry);
+  /* Elapsed time, from the sample clock where there is one. Rate metrics used
+     to divide by the whole wall time including the minutes the candidate was
+     in another tab, which quietly deflated every per-minute figure. */
+  const span = arr => arr.length > 1 ? Math.max(0.2, (arr.at(-1).t - arr[0].t) / 1000) : 0;
+  // Frame count over the live rate is only a guess, and only worth making when
+  // there is no clock to read: with two samples the span itself is the truth.
+  const wallSecs = Math.max(span(all) || all.length / Math.max(1, Video.fps), 1);
 
-  // blinks: count rising edges through the closed threshold
-  let blinks = 0, wasClosed = false;
-  for (const s of seen) {
-    if (s.blink === null) continue;
-    const closed = s.blink > 0.5;
-    if (closed && !wasClosed) blinks++;
-    wasClosed = closed;
+  /* The frame interval has to be the *median* gap, not the mean. A paused
+     interview leaves one enormous gap in the middle of the series, and a mean
+     over it reports a 15Hz session as running at 12.8Hz and stretches
+     "measured time" to cover minutes when the camera was off. The median
+     ignores the gap and returns the rate the loop actually ran at. */
+  const gaps = [];
+  for (let i = 1; i < S.length; i++) gaps.push(S[i].t - S[i - 1].t);
+  gaps.sort((a, b) => a - b);
+  const dt = (gaps.length ? gaps[gaps.length >> 1] : 1000 / Math.max(1, Video.fps)) / 1000;
+  const measuredSecs = Math.max(S.length * dt, 0.2);
+  const hz = dt > 0 ? +(1 / dt).toFixed(1) : null;
+
+  const gazeF = seen.filter(s => s.gaze !== null);
+  const hasGaze = gazeF.length >= 3;
+  const gaze = hasGaze ? avg(gazeF, s => s.gaze) : avg(seen, s => s.symmetry);
+
+  /* Blinks, with hysteresis and a refractory gap. A single threshold on a
+     noisy score double-counts the flicker at the edge of a blink; requiring
+     the eye to reopen past a lower mark, and at least 90ms between events,
+     counts blinks rather than threshold crossings. */
+  let blinks = 0, closed = false, lastBlink = -1e9;
+  const blinkF = seen.filter(s => s.blink !== null);
+  for (const s of blinkF) {
+    if (!closed && s.blink > 0.55) {
+      if (s.t - lastBlink > 90) { blinks++; lastBlink = s.t; }
+      closed = true;
+    } else if (closed && s.blink < 0.3) closed = false;
   }
-  const secs = Math.max((all.at(-1)?.t - all[0]?.t) / 1000 || all.length / Video.FPS, 1);
+  const blinkSecs = span(blinkF);
+  /* A blink rate needs a stretch of video to mean anything: over ten seconds
+     one missed blink swings the figure by six a minute. */
+  const blinkRate = blinkF.length > 8 && blinkSecs > 25 ? +(blinks / (blinkSecs / 60)).toFixed(1) : null;
+
+  /* Lapses: stretches of at least 1.2s with gaze on the floor. One number for
+     "you look away a lot in short flicks" and another for "you disengaged for
+     nine seconds" — the second is the one that costs an offer. */
+  let lapses = 0, longestLapse = 0, runStart = null;
+  for (const s of S) {
+    // A frame with no gaze reading — a blink, or a moment the mesh lost lock —
+    // is not evidence either way, so it neither starts nor ends a lapse.
+    const g = !s.face ? 0 : s.gaze;
+    if (g === null) continue;
+    if (g < 0.33) { if (runStart === null) runStart = s.t; }
+    else if (runStart !== null) {
+      const len = (s.t - runStart) / 1000;
+      if (len >= 1.2) { lapses++; longestLapse = Math.max(longestLapse, len); }
+      runStart = null;
+    }
+  }
+
+  /* Position has to be read from one source or the other, never both mixed.
+     The landmark engine's cx/cy is the midpoint of the eye line; the pixel
+     engine's is the centroid of the skin mask, which sits lower because it
+     includes the neck. Averaging the two, or taking a standard deviation
+     across them, turns every moment the mesh lost and regained lock into a
+     sudden head movement that never happened. */
+  const lm = seen.filter(s => s.lmFace);
+  const geo = lm.length >= seen.length * 0.5 ? lm : seen;
+
+  /* Stillness, normalised by how big the face is in frame. The same physical
+     sway is many more pixels of travel when you are sitting close, and the old
+     unnormalised figure told people sitting near the laptop that they fidget. */
+  const scale = seen.some(s => s.scale) ? Math.max(0.35, med(seen.filter(s => s.scale), s => s.scale)) : 1;
+  const steadiness = geo.length >= 4
+    ? +clamp(1 - (sd(geo, s => s.cx) + sd(geo, s => s.cy)) * 9 / scale, 0, 1).toFixed(3)
+    : 0;
+
+  /* The per-frame brow/eye/chin ratio deliberately does not become a finding.
+     It would be the natural way to tell someone their laptop is too low and the
+     interviewer is looking up their nose, but the neutral value of that ratio
+     depends on where a person's hairline is, and there is no reference here to
+     calibrate it against. A posture verdict built on it would be confidently
+     wrong for a lot of faces, so the number stays raw. */
 
   return {
     frames: n, awayFrames: Math.max(0, all.length - S.length), presence: +presence.toFixed(3),
@@ -3764,13 +4160,20 @@ function summarise(all) {
        would otherwise report a perfect 1.0 for someone who was never on camera. */
     measurable: seen.length >= 4,
     gaze: +gaze.toFixed(3), gazeMeasured: hasGaze,
-    steadiness: seen.length >= 4
-      ? +clamp(1 - (sd(seen, s => s.cx) * 9 + sd(seen, s => s.cy) * 9) / 2, 0, 1).toFixed(3)
-      : 0,
+    gazeCoverage: +(gazeF.length / Math.max(1, seen.length)).toFixed(2),
+    lapses, longestLapse: +longestLapse.toFixed(1),
+    /* Where the eyes went when they went: a steady pull in one direction is a
+       second monitor or a page of notes, and that is a fixable setup problem
+       rather than a character flaw. */
+    gazeDirX: hasGaze ? +avg(seen.filter(s => s.gx !== null), s => s.gx).toFixed(3) : null,
+    gazeDirY: hasGaze ? +avg(seen.filter(s => s.gy !== null), s => s.gy).toFixed(3) : null,
+    steadiness,
     motion: +avg(seen, s => s.motion).toFixed(3),
-    faceArea: +avg(seen, s => s.faceArea).toFixed(3),
-    cx: +avg(seen, s => s.cx).toFixed(3),
-    cy: +avg(seen, s => s.cy).toFixed(3),
+    faceArea: +avg(geo, s => s.faceArea).toFixed(3),
+    scale: seen.some(s => s.scale) ? +scale.toFixed(2) : null,
+    cx: +avg(geo, s => s.cx).toFixed(3),
+    cy: +avg(geo, s => s.cy).toFixed(3),
+    geoMeasured: geo === lm,
     brightness: +avg(S, s => s.brightness).toFixed(3),
     faceBrightness: seen.some(s => s.faceBrightness !== null)
       ? +avg(seen.filter(s => s.faceBrightness !== null), s => s.faceBrightness).toFixed(3)
@@ -3779,9 +4182,10 @@ function summarise(all) {
     blown: +avg(S, s => s.blown || 0).toFixed(3),
     contrast: +avg(S, s => s.contrast).toFixed(3),
     smile: seen.some(s => s.smile !== null) ? +avg(seen.filter(s => s.smile !== null), s => s.smile).toFixed(3) : null,
-    blinkRate: blinks ? +(blinks / (secs / 60)).toFixed(1) : null,
-    yawSd: hasGaze ? +sd(seen.filter(s => s.yaw !== null), s => s.yaw).toFixed(1) : null,
-    secs: Math.round(secs),
+    blinkRate,
+    roll: seen.some(s => s.roll !== null) ? +med(seen.filter(s => s.roll !== null), s => s.roll).toFixed(1) : null,
+    yawSd: hasGaze && seen.some(s => s.yaw !== null) ? +sd(seen.filter(s => s.yaw !== null), s => s.yaw).toFixed(1) : null,
+    secs: Math.round(wallSecs), measuredSecs: Math.round(measuredSecs), hz,
   };
 }
 
@@ -3834,6 +4238,24 @@ function diagnoseVideo(v) {
         : "Move the interviewer's window to the top of your screen, directly under the webcam, and hide your self-view — watching yourself is the single biggest cause of this. Look at the lens, not the face, when you start an answer and when you finish one." });
   }
 
+  /* 2b · sustained lapses. Short glances away are normal and human; a nine
+     second stretch of looking somewhere else is the thing an interviewer
+     actually remembers, and averaging hides it completely. */
+  if (v.gazeMeasured && (v.lapses > 0 || v.longestLapse > 0)) {
+    const worst = v.longestLapse;
+    const perMin = v.lapses / Math.max(1, v.measuredSecs / 60);
+    const s = worst >= 6 ? 0.15 : worst >= 3 ? 0.45 : perMin > 4 ? 0.55 : perMin > 1.5 ? 0.8 : 1;
+    F.push({ key: "lapses", label: "Sustained attention", score: s, band: band(s, .8, .45),
+      value: v.lapses ? `${v.lapses} lapse${v.lapses > 1 ? "s" : ""}, longest ${worst}s` : "none",
+      verdict: worst >= 6 ? `Your longest stretch of looking away lasted about ${worst} seconds. At that length the interviewer stops listening and starts wondering what you are reading.`
+        : worst >= 3 ? `You broke away for up to ${worst} seconds at a time — long enough to be noticed.`
+        : perMin > 4 ? "Lots of quick glances away. Individually fine, but the pattern reads as restless."
+        : "You held attention steadily, with only the natural short glances away.",
+      fix: worst >= 3 ? "If you need notes, put them on a card taped just beside the lens — a glance there costs you nothing, a look down at a second screen costs you the room. Say your thought out loud while you look for the next one instead of going silent and searching."
+        : perMin > 4 ? "Pick one thing to look at between sentences — the lens — and come back to it every time you start a new point."
+        : "Nothing to change." });
+  }
+
   // 3 · stillness
   {
     const s = clamp(v.steadiness, 0, 1);
@@ -3861,14 +4283,21 @@ function diagnoseVideo(v) {
         : "Nothing to fix." });
   }
 
-  /* 5 · framing — skipped when the face is too dark to segment reliably, since
-     a badly-lit face reads as a small one and we'd blame the wrong thing. */
-  if ((v.crushed ?? 0) < 0.35) {
-    const area = v.faceArea;
+  /* 5 · framing. With landmarks this is face width against frame width, which
+     is a real measurement; with the pixel engine it is skin-mask area, and it
+     is skipped when the face is too dark to segment reliably, since a badly-lit
+     face reads as a small one and we'd blame the wrong thing. */
+  if (v.scale !== null || (v.crushed ?? 0) < 0.35) {
     const offX = Math.abs(v.cx - 0.5), offY = Math.abs(v.cy - 0.42);
-    const sizeOk = area > 0.045 && area < 0.3;
-    const s = clamp((sizeOk ? 0.6 : 0.2) + (1 - clamp(offX * 3.6, 0, 1)) * 0.22 + (1 - clamp(offY * 3.2, 0, 1)) * 0.18, 0, 1);
-    const tooFar = area <= 0.045, tooClose = area >= 0.3;
+    let sizeScore, tooFar, tooClose;
+    if (v.scale !== null) {
+      tooFar = v.scale < 0.72; tooClose = v.scale > 1.45;
+      sizeScore = clamp(1 - Math.abs(v.scale - 1) * 1.5, 0, 1);
+    } else {
+      tooFar = v.faceArea <= 0.045; tooClose = v.faceArea >= 0.3;
+      sizeScore = tooFar || tooClose ? 0.25 : 1;
+    }
+    const s = clamp(sizeScore * 0.6 + (1 - clamp(offX * 3.6, 0, 1)) * 0.22 + (1 - clamp(offY * 3.2, 0, 1)) * 0.18, 0, 1);
     F.push({ key: "framing", label: "Framing", score: s, band: band(s, .75, .5),
       value: tooFar ? "too far away" : tooClose ? "too close" : offX > 0.14 ? "off-centre" : "well framed",
       verdict: tooFar ? "You're sitting too far from the camera — your face is a small part of the frame."
@@ -3903,7 +4332,23 @@ function diagnoseVideo(v) {
         : "Lighting setup is fine — reuse it." });
   }
 
-  // 7 · expression, only when it was genuinely measured
+  /* 7 · head tilt, straight off the angle of the eye line. A one-line setup fix
+     nobody notices about themselves: a head held permanently at an angle reads
+     as quizzical rather than attentive, and it is almost always the screen, not
+     the person. */
+  if (v.roll !== null) {
+    const tilt = Math.abs(v.roll);
+    const s = tilt < 5 ? 1 : tilt < 10 ? 0.75 : tilt < 16 ? 0.5 : 0.3;
+    F.push({ key: "headpose", label: "Head position", score: s, band: band(s, .8, .5),
+      value: tilt < 5 ? "level" : `${tilt.toFixed(0)}° tilt`,
+      verdict: tilt < 5 ? "Your head sat level and square to the camera."
+        : tilt < 10 ? `A slight, consistent head tilt of about ${tilt.toFixed(0)}°.`
+        : `You held your head tilted about ${tilt.toFixed(0)}° for most of the interview. It reads as quizzical, and it is usually the laptop screen angle rather than you.`,
+      fix: tilt < 5 ? "Nothing to change."
+        : "Square the screen to your face and put the laptop on a stand or a stack of books so the lens sits at eye height. Check the preview: your eye line should be about a third of the way down the frame." });
+  }
+
+  // 8 · expression, only when it was genuinely measured
   if (v.smile !== null) {
     const s = v.smile < 0.03 ? 0.4 : v.smile < 0.25 ? 1 : 0.7;
     F.push({ key: "expression", label: "Expression", score: s, band: band(s, .8, .5),
@@ -3939,13 +4384,102 @@ function diagnoseVideo(v) {
       fix: "Close everything else before you start, and put your phone face down in another room. On a real call the interviewer sees your eyes track away and hears the typing — looking something up mid-answer costs you more than not knowing it." });
   }
 
-  const W = { presence: .2, gaze: .26, steadiness: .13, energy: .1, framing: .13, lighting: .08, expression: .06, blink: .04, attention: .16 };
+  const W = { presence: .18, gaze: .24, lapses: .12, steadiness: .11, energy: .08, framing: .12,
+              lighting: .07, headpose: .05, expression: .05, blink: .03, attention: .15 };
   let num = 0, den = 0;
   for (const f of F) { const w = W[f.key] || .05; num += f.score * w; den += w; }
   const overall = Math.round((den ? num / den : 0) * 100);
 
   return { overall, findings: F, raw: v,
     engine: v.gazeMeasured ? "landmarks" : "builtin" };
+}
+
+/**
+ * Plain-language note on where the eyes actually went. Averages say "62%";
+ * this says "down and to your left, which is where your notes are".
+ */
+function gazeDirectionNote(v) {
+  if (!v || !v.gazeMeasured || v.gazeDirX === null) return "";
+  const x = v.gazeDirX, y = v.gazeDirY ?? 0;
+  const horiz = Math.abs(x) > 0.1 ? (x > 0 ? "to your left" : "to your right") : "";
+  const vert = y < -0.14 ? "down" : y > 0.12 ? "up" : "";
+  if (!horiz && !vert) return "";
+  const where = [vert, horiz].filter(Boolean).join(" and ");
+  return `Your eyes pulled ${where} more than anywhere else — that is usually a second monitor, a phone, or notes sitting off to one side. Move whatever it is directly under the webcam.`;
+}
+
+/**
+ * The attention strip: eye contact over the whole session as one picture.
+ *
+ * An average is the one number a candidate cannot act on — 58% could be a
+ * steady, slightly-low gaze or four minutes of perfect contact wrapped around
+ * a catastrophic third question, and those need opposite advice. The strip
+ * shows which one it was, marks where each answer sat, and seeks the recording
+ * when you click it.
+ */
+function videoStrip(series, segs, durMs) {
+  if (!series.length) return "";
+  const W = 1000, H = 92, dur = Math.max(1, durMs / 1000);
+  const x = t => clamp(t / dur, 0, 1) * W;
+  const y = g => H - 6 - clamp(g, 0, 1) * (H - 14);
+
+  // gaps in the line are honest: a blink or a lost lock is not a zero
+  const runs = [];
+  let cur = null;
+  for (const p of series) {
+    if (p.g === null || p.away) { cur = null; continue; }
+    if (!cur) { cur = []; runs.push(cur); }
+    cur.push(p);
+  }
+  const path = runs.filter(r => r.length > 1)
+    .map(r => "M" + r.map(p => `${x(p.t).toFixed(1)},${y(p.g).toFixed(1)}`).join("L")).join(" ");
+  const area = runs.filter(r => r.length > 1)
+    .map(r => `M${x(r[0].t).toFixed(1)},${H} L` + r.map(p => `${x(p.t).toFixed(1)},${y(p.g).toFixed(1)}`).join("L") + ` L${x(r.at(-1).t).toFixed(1)},${H}Z`).join(" ");
+
+  // contiguous away / off-camera stretches, drawn as bands behind the line
+  const bands = (key, fill) => {
+    const out = []; let start = null;
+    series.forEach((p, i) => {
+      if (p[key] && start === null) start = p.t;
+      if ((!p[key] || i === series.length - 1) && start !== null) {
+        out.push(`<rect x="${x(start).toFixed(1)}" y="0" width="${Math.max(2, x(p.t) - x(start)).toFixed(1)}" height="${H}" fill="${fill}"/>`);
+        start = null;
+      }
+    });
+    return out.join("");
+  };
+
+  /* Each answer gets a band along the bottom coloured by its own presence
+     score, and a hairline where it starts. Without the boundaries the dips in
+     the line are unattributable — with them you can see that the bad stretch
+     was all of question three. */
+  const marks = segs.map(seg => {
+    const g = diagnoseVideo(seg);
+    const [bg] = scoreColor((g?.overall ?? 0) / 20);
+    const a = Video.mediaTime(seg.t0 || 0), b = Video.mediaTime(seg.t1 || 0);
+    const x0 = x(a / 1000), w = Math.max(3, x((b - a) / 1000));
+    return `<rect x="${x0.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${H}" fill="transparent"><title>Q${seg.i + 1} · ${esc(seg.topic)} — presence ${g?.overall ?? 0}/100</title></rect>`
+      + `<line x1="${x0.toFixed(1)}" y1="0" x2="${x0.toFixed(1)}" y2="${H - 9}" stroke="var(--line)" stroke-width="1" vector-effect="non-scaling-stroke" opacity=".7"/>`
+      + `<rect class="seg" x="${(x0 + 0.5).toFixed(1)}" y="${H - 8}" width="${Math.max(2, w - 1).toFixed(1)}" height="8" fill="${bg}"/>`;
+  }).join("");
+
+  return `
+  <svg class="vstrip" id="vidStrip" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+       aria-label="Eye contact over the interview, with the questions marked along the bottom">
+    <defs>
+      <linearGradient id="vsFill" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="var(--accent)" stop-opacity=".55"/>
+        <stop offset="1" stop-color="var(--accent)" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    <rect x="0" y="0" width="${W}" height="${H}" fill="var(--surface-2)"/>
+    ${bands("away", "#EF444455")}${bands("off", "var(--line)")}
+    <line x1="0" y1="${y(0.62).toFixed(1)}" x2="${W}" y2="${y(0.62).toFixed(1)}" stroke="var(--line)" stroke-width="1" stroke-dasharray="5 6"/>
+    <path d="${area}" fill="url(#vsFill)"/>
+    <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+    ${marks}
+    <line id="vidHead" x1="0" y1="0" x2="0" y2="${H}" stroke="var(--text)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity="0"/>
+  </svg>`;
 }
 
 /* ---------------------------------------------------------------
@@ -4763,6 +5297,9 @@ async function buildReport() {
   const vidSegs = T.map((t, i) => ({ ...t.video, i, topic: topicOf(t), q: t.q })).filter(s => s.frames);
   const allVid = Video.samples.length ? summarise(Video.samples) : null;
   const vid = allVid ? diagnoseVideo(allVid) : null;
+  const vidSeries = vid && !vid.unmeasurable ? Video.series() : [];
+  const vidStrip = vidSeries.length > 4 ? videoStrip(vidSeries, vidSegs, Video.mediaDuration()) : "";
+  const vidNote = allVid ? gazeDirectionNote(allVid) : "";
 
   // study plan — LLM if available, otherwise straight from the graph
   let plan = null;
@@ -4868,15 +5405,21 @@ The "week" array must have exactly 7 entries, Day 1 to Day 7.`, { modelTier: "de
         ${Video.blobUrl
           ? `<video class="vid-player" id="vidPlayer" src="${Video.blobUrl}" controls playsinline></video>`
           : `<div class="vid-player" style="display:grid;place-items:center;color:var(--text-dim);font-size:13px;text-align:center;padding:16px">Playback wasn't captured,<br>but the analysis below still ran.</div>`}
+        ${Video.blobUrl ? `
+          <div class="row" style="gap:8px;margin-top:10px">
+            <button class="btn ghost sm" id="vidWorst" title="Jump to the longest stretch you spent looking away">Worst moment</button>
+            <a class="btn ghost sm" id="vidSave" href="${Video.blobUrl}" download="preppilot-interview.webm" style="text-decoration:none">Save recording</a>
+          </div>` : ""}
         ${vidSegs.length ? `
-          <p class="small muted" style="margin:10px 0 0">Per question — click to jump to that answer.</p>
+          <p class="small muted" style="margin:14px 0 0">Presence per question.</p>
           <div class="vtl" id="vidTimeline">
             ${vidSegs.map(s => {
               const g = diagnoseVideo(s);
               const [bg, fg] = scoreColor((g?.overall ?? 0) / 20);
-              return `<button data-t="${Math.max(0, (s.t0 || 0) / 1000)}" style="background:${bg};color:${fg}" title="${esc(s.topic)} — presence ${g?.overall ?? 0}/100">${s.i + 1}</button>`;
+              return `<button data-t="${Math.max(0, Video.mediaTime(s.t0 || 0) / 1000)}" style="background:${bg};color:${fg}" title="${esc(s.topic)} — presence ${g?.overall ?? 0}/100">${s.i + 1}</button>`;
             }).join("")}
           </div>` : ""}
+        ${vidNote ? `<p class="small" style="margin:14px 0 0;color:var(--text-dim);line-height:1.6">${esc(vidNote)}</p>` : ""}
       </div>
       <div>
         ${vid.findings.map(f => `
@@ -4886,8 +5429,38 @@ The "week" array must have exactly 7 entries, Day 1 to Day 7.`, { modelTier: "de
             <p>${esc(f.verdict)}</p>
             ${f.band === "good" ? "" : `<div class="fix"><p><strong>Fix:</strong> ${esc(f.fix)}</p></div>`}
           </div>`).join("")}
+        <details class="vraw">
+          <summary class="small muted">How these numbers were measured</summary>
+          <table class="kv" style="margin-top:10px">
+            <tr><td>Engine</td><td>${vid.engine === "landmarks" ? "MediaPipe face mesh" : "frame geometry"}</td></tr>
+            <tr><td>Frames analysed</td><td>${allVid.frames}</td></tr>
+            <tr><td>Sample rate</td><td>${allVid.hz ?? "—"}/s</td></tr>
+            <tr><td>Time on camera</td><td>${Math.floor(allVid.measuredSecs / 60)} min ${allVid.measuredSecs % 60}s</td></tr>
+            <tr><td>Gaze readings</td><td>${Math.round((allVid.gazeCoverage ?? 0) * 100)}% of frames</td></tr>
+            <tr><td>Framing measured from</td><td>${allVid.geoMeasured ? "face mesh" : "skin mask"}</td></tr>
+            ${allVid.scale !== null ? `<tr><td>Face size vs ideal</td><td>${allVid.scale.toFixed(2)}×</td></tr>` : ""}
+            ${allVid.yawSd !== null ? `<tr><td>Head turn spread</td><td>±${allVid.yawSd}°</td></tr>` : ""}
+          </table>
+        </details>
       </div>
     </div>
+    ${vidStrip ? `
+    <div class="vstrip-wrap">
+      <div class="row" style="justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:6px">
+        <p class="small muted" style="margin:0">Eye contact across the whole interview — click anywhere to jump the recording there.</p>
+        <div class="vlegend">
+          <span><i style="background:var(--accent)"></i>eye contact</span>
+          <span><i style="background:var(--line)"></i>good-contact line</span>
+          <span><i style="background:var(--line)"></i>off camera</span>
+          <span><i style="background:#EF444455;border:1px solid #EF4444aa"></i>left the tab</span>
+        </div>
+      </div>
+      ${vidStrip}
+      <div class="vscale">
+        <span>start</span>
+        <span>${Math.round(Video.mediaDuration() / 60000)} min</span>
+      </div>
+    </div>` : ""}
   </div>` : ""}
 
   <div class="card" style="margin-bottom:18px">
@@ -4967,13 +5540,61 @@ The "week" array must have exactly 7 entries, Day 1 to Day 7.`, { modelTier: "de
   $("#againBtn").onclick = () => { go("onboard"); };
   $("#saveBtn").onclick = () => downloadReport(overall, axes, mastery, plan, diagnosis, vid);
 
-  // jump the playback to the answer a timeline cell belongs to
+  /* Everything in the video card is a way into the recording: the per-question
+     cells, any point on the attention strip, and the one button that takes you
+     straight to the moment the report is actually complaining about. A finding
+     you cannot go and watch is just a number. */
   const player = $("#vidPlayer");
+  const seek = t => {
+    if (!player) return;
+    player.currentTime = Math.max(0, t);
+    player.play().catch(() => {});
+    player.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
+
   $("#vidTimeline")?.addEventListener("click", e => {
     const b = e.target.closest("button");
-    if (!b || !player) return;
-    player.currentTime = +b.dataset.t || 0;
-    player.play().catch(() => {});
+    if (b) seek(+b.dataset.t || 0);
+  });
+
+  const strip = $("#vidStrip");
+  const stripDur = Video.mediaDuration() / 1000;
+  if (strip && stripDur > 0) {
+    strip.addEventListener("click", e => {
+      const r = strip.getBoundingClientRect();
+      seek((e.clientX - r.left) / r.width * stripDur);
+    });
+    // playhead follows the recording so the strip and the video agree
+    const head = $("#vidHead");
+    const cells = $$("#vidTimeline button");
+    player?.addEventListener("timeupdate", () => {
+      const f = clamp(player.currentTime / stripDur, 0, 1);
+      if (head) { head.setAttribute("x1", f * 1000); head.setAttribute("x2", f * 1000); head.setAttribute("opacity", "1"); }
+      let cur = null;
+      for (const c of cells) if ((+c.dataset.t || 0) <= player.currentTime) cur = c;
+      cells.forEach(c => c.classList.toggle("now", c === cur));
+    });
+  }
+
+  /* The longest unbroken stretch of looking away — the thing an interviewer
+     would remember, found by walking the raw samples rather than the strip so
+     the timestamp is exact. */
+  $("#vidWorst")?.addEventListener("click", () => {
+    let best = { len: 0, t: 0 }, start = null, prev = null;
+    for (const s of Video.samples) {
+      if (s.away) continue;
+      const g = !s.face ? 0 : s.gaze;
+      if (g === null) continue;
+      if (g < 0.33) { if (start === null) start = s.t; prev = s.t; }
+      else if (start !== null) {
+        if (prev - start > best.len) best = { len: prev - start, t: start };
+        start = null;
+      }
+    }
+    if (start !== null && prev - start > best.len) best = { len: prev - start, t: start };
+    if (best.len < 600) return toast("No stretch of looking away worth jumping to — nicely held.");
+    toast(`Jumping to your longest look away — about ${Math.round(best.len / 1000)}s.`);
+    seek(Video.mediaTime(best.t) / 1000 - 1.5);
   });
 
   // history
@@ -5617,7 +6238,8 @@ if (/\bdebug=1\b/.test(location.search)) {
     parseResume, scoreATS, linkSkills, buildBlueprint, rubricFor,
     drawFace, setFace, FACE_STATES, Robot, Human, TTS, classifyUtterance, EXPR,
     heuristicEval, analyseSpeech, contentTokens, domainTokens, isQualitative,
-    scoreQualitative, coverage, summarise, diagnoseVideo, diagnoseInterview, avgScore };
+    scoreQualitative, coverage, summarise, diagnoseVideo, videoStrip, gazeDirectionNote,
+    diagnoseInterview, avgScore };
   console.info("PrepPilot debug surface ready on window.__pp");
 }
 
