@@ -77,35 +77,152 @@ function speechSignals(text, secs) {
   };
 }
 
-/** Pull numeric claims ("1 million records", "94% accuracy") out of free text. */
+/* ---------- numeric claims ----------
+   Pull quantitative claims ("1 million records", "94% accuracy", "p95 300ms")
+   out of free text so the interviewer can cross-examine them.
+
+   This parser is deliberately conservative. A false positive here is expensive:
+   it makes the interviewer accuse an honest candidate of contradicting
+   themselves, which is worse than missing a claim entirely. Three rules keep it
+   honest:
+     1. A magnitude suffix only counts when it ends the word — "5 m" is five
+        million, "5 minutes" is not, and "300ms" is a latency, not 300 million.
+     2. Notation that merely contains a digit (p95, O(1), 5-fold, v2, top-3,
+        HTTP 200) is excluded outright — those are names, not measurements.
+     3. Metrics are keyed by which metric they are, so precision 0.72 and
+        recall 0.65 never look like the same number disagreeing with itself. */
+
 const MULT = { k: 1e3, thousand: 1e3, lakh: 1e5, m: 1e6, mn: 1e6, million: 1e6, crore: 1e7, b: 1e9, bn: 1e9, billion: 1e9 };
-const CLAIM_KEYS = [
-  ["dataset_size", /\b(records?|rows?|samples?|images?|data ?points?|examples?|documents?|entries)\b/i],
-  ["users", /\b(users?|customers?|students?|clients?|concurrent)\b/i],
-  ["throughput", /\b(requests? per second|rps|qps|req\/s|transactions? per second|tps)\b/i],
-  ["accuracy", /\b(accuracy|f1|precision|recall|auc)\b/i],
-  ["latency", /\b(latency|response time|p95|p99|ms\b|milliseconds?)\b/i],
-  ["team_size", /\b(team of|people|members?|engineers?|developers?)\b/i],
-  ["duration", /\b(months?|weeks?|days?|years?)\b/i],
+
+/* A unit written immediately after the number settles what it measures.
+   `norm` puts every member of a family on one scale so 1.2s and 300ms compare. */
+const UNITS = [
+  [/^(ms|millisecs?|milliseconds?)\b/i,            "latency",     v => v],
+  [/^(s|secs?|seconds?)\b/i,                        "latency",     v => v * 1e3],
+  [/^(m|mins?|minutes?)\b/i,                        "duration",    v => v / 60],
+  [/^(h|hrs?|hours?)\b/i,                           "duration",    v => v],
+  [/^(d|days?)\b/i,                                 "duration",    v => v * 24],
+  [/^(w|weeks?)\b/i,                                "duration",    v => v * 168],
+  [/^(mo|months?)\b/i,                              "duration",    v => v * 730],
+  [/^(y|yrs?|years?)\b/i,                           "duration",    v => v * 8760],
+  [/^(rps|qps|tps|req\/s|reqs?\/sec)\b/i,           "throughput",  v => v],
+  [/^(requests?|queries|transactions?)\s+per\s+sec/i, "throughput", v => v],
+  [/^(bytes?|kb|mb|gb|tb|kilobytes?|megabytes?|gigabytes?|terabytes?)\b/i, "data_volume", v => v],
+  [/^(x|times)\b/i,                                 null,          v => v],   // "10x" is a factor, not a quantity
 ];
+
+/* When no unit is attached, the noun that follows names the quantity. Up to two
+   modifier words may sit in between — "50000 telecom records", "2000 scanned
+   PDF documents" — but no more, so a noun a whole clause away doesn't count. */
+const GAP = "^[\\s,]*(?:[a-z][a-z-]*\\s+){0,2}";
+const CLAIM_KEYS = [
+  ["dataset_size", new RegExp(GAP + "(records?|rows?|samples?|images?|data ?points?|examples?|documents?|docs?|pdfs?|files?|entries|tuples?)\\b", "i")],
+  ["users",        new RegExp(GAP + "(users?|customers?|students?|clients?|subscribers?)\\b", "i")],
+  ["team_size",    new RegExp(GAP + "(people|members?|engineers?|developers?|interns?|devs?)\\b", "i")],
+  ["duration",     new RegExp(GAP + "(months?|weeks?|days?|years?|hours?|sprints?|semesters?)\\b", "i")],
+  ["throughput",   new RegExp(GAP + "(requests?|queries|transactions?|events?|messages?)\\s+(per|a)\\s+(second|sec|min|minute)\\b", "i")],
+];
+
+/* Metric names, kept distinct so two different metrics never "contradict". */
+const METRICS = [
+  ["accuracy",  /\b(accuracy|accurate)\b/i],
+  ["precision", /\bprecision\b/i],
+  ["recall",    /\brecall\b/i],
+  ["f1",        /\bf1(?:[ -]?score)?\b/i],
+  ["auc",       /\b(auc|roc[ -]?auc|pr[ -]?auc)\b/i],
+  ["coverage",  /\b(test |code )?coverage\b/i],
+];
+
+/* "precision 0.72, recall 0.65" — pick the metric name nearest the number,
+   not the first one that happens to appear in the window. */
+function nearestMetric(src, pos, radius = 44) {
+  let best = null, bestD = Infinity;
+  for (const [name, r] of METRICS) {
+    const rg = new RegExp(r.source, "gi");
+    let mm;
+    while ((mm = rg.exec(src))) {
+      const end = mm.index + mm[0].length;
+      const d = end <= pos ? pos - end : mm.index - pos;
+      if (d >= 0 && d <= radius && d < bestD) { bestD = d; best = name; }
+    }
+  }
+  return best;
+}
+
+/* Digit-bearing notation that is a name, not a measurement. Checked against the
+   few characters on either side of the match. */
+const NOT_A_QUANTITY = [
+  /\bp\d{1,3}$/i,                 // p50, p95, p99 — a percentile label
+  /\bo\s*\($/i,                   // O(1), O(n log n) — complexity notation
+  /\bv$/i,                        // v2, v3 — a version
+  /\btop[- ]$/i,                  // top-5, top-k
+  /\bk[- ]?$/i,                   // k-fold written as "k 5"
+  /\bhttp[s]?\s*$/i,              // HTTP 200
+  /\bport\s*$/i,
+  /\bnode\.?js\s*$/i, /\bpython\s*$/i, /\bes\s*$/i,   // Node 18, Python 3, ES6
+];
+const NOT_A_QUANTITY_AFTER = [
+  /^[- ]?fold\b/i,                // 5-fold cross validation
+  /^[- ]?gram\b/i,                // n-gram, 3-gram
+  /^\s*\)/,                       // trailing half of O(1)
+  /^\.\d+\.\d+/,                  // semver 1.2.3
+  /^[- ]?bit\b/i,                 // 8-bit
+];
+
 function numericClaims(text) {
   const out = [];
-  const re = /(\d+(?:[.,]\d+)?)\s*(k|m|mn|b|bn|thousand|lakh|million|crore|billion)?\s*(%|percent)?/gi;
+  const src = String(text == null ? "" : text);
+  // number, optional magnitude word (must END the word), optional percent
+  const re = /(\d+(?:[.,]\d+)?)\s*(?:(k|m|mn|b|bn|thousand|lakh|million|crore|billion)(?![a-z]))?\s*(%|percent\b)?/gi;
   let m;
-  const src = String(text);
   while ((m = re.exec(src))) {
     const raw = m[0].trim();
-    if (!raw || /^\d{4}$/.test(raw) && +raw > 1900 && +raw < 2100) continue;     // a year, not a claim
-    let v = parseFloat(m[1].replace(/,/g, ""));
+    if (!raw) { re.lastIndex++; continue; }
+
+    const before = src.slice(Math.max(0, m.index - 14), m.index);
+    const afterRaw = src.slice(m.index + m[0].length, m.index + m[0].length + 40);
+    if (NOT_A_QUANTITY.some(r => r.test(before))) continue;
+    if (NOT_A_QUANTITY_AFTER.some(r => r.test(afterRaw))) continue;
+
+    const digits = m[1].replace(/,/g, "");
+    // A bare year never survives key detection below (nothing quantifiable
+    // follows it), so it needs no special case here — but "2021-2025" would
+    // otherwise read the second year as a quantity, so drop explicit ranges.
+    if (/^\d{4}$/.test(digits) && +digits > 1900 && +digits < 2100 && /[-–—]\s*$/.test(before)) continue;
+
+    let v = parseFloat(digits);
+    if (!isFinite(v)) continue;
     if (m[2]) v *= MULT[m[2].toLowerCase()] || 1;
+
     const pct = !!m[3];
-    const around = src.slice(Math.max(0, m.index - 40), m.index + raw.length + 40);
-    const after = src.slice(m.index + raw.length, m.index + raw.length + 36);
-    let key = null;
-    for (const [k, r] of CLAIM_KEYS) if (r.test(after) || (k === "accuracy" && pct && r.test(around))) { key = k; break; }
-    if (!key && pct) key = /accura|f1|precision|recall|auc/i.test(around) ? "accuracy" : null;
+    const around = src.slice(Math.max(0, m.index - 48), m.index + raw.length + 48);
+    let key = null, unit = null;
+
+    // 1 · an explicit unit wins
+    for (const [r, k, norm] of UNITS) {
+      if (!r.test(afterRaw)) continue;
+      if (k === null) { key = null; unit = "skip"; break; }
+      key = k; v = norm(v); unit = k; break;
+    }
+    if (unit === "skip") continue;
+
+    // 2 · a percentage next to a named metric
+    if (!key && pct) {
+      const name = nearestMetric(src, m.index);
+      if (name) key = "metric:" + name;
+      else if (/\b(improv|increas|reduc|decreas|drop|cut|grew|faster|slower)\w*\b/i.test(around)) continue; // "improved by 40%" is a delta, not a level
+    }
+    // 3 · a bare decimal next to a named metric ("precision 0.72")
+    if (!key && !pct && v <= 1 && /\./.test(digits)) {
+      const name = nearestMetric(src, m.index);
+      if (name) key = "metric:" + name;
+    }
+    // 4 · the noun that follows
+    if (!key) for (const [k, r] of CLAIM_KEYS) if (r.test(afterRaw)) { key = k; break; }
+
     if (!key) continue;
-    out.push({ key, value: v, pct, quote: around.replace(/\s+/g, " ").trim() });
+    if (key === "data_volume") continue;                 // tracked but never cross-examined
+    out.push({ key, value: v, pct, unit: unit || null, quote: around.replace(/\s+/g, " ").trim() });
   }
   return out;
 }

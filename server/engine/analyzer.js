@@ -43,10 +43,44 @@ const PROBES = [
   { test: /communicat|stakeholder|team|disagree|committed/i, score: (s, a) => /\b(I told|I asked|we agreed|the team|my teammate|stakeholder|manager|flagged|raised it)\b/i.test(a) ? 1 : .3 },
   { test: /diagnos|shift|monitor|baseline|data/i, score: (s, a) => /\b(check(ed)?|compar(e|ed)|monitor|distribution|drift|baseline|logs?|profil)\b/i.test(a) ? 1 : .25 },
   { test: /break|fail|load|limit|scale|bottleneck/i, score: (s, a) => /\b(break|fail|bottleneck|saturat|run out|ceiling|limit|times the load|under load|scal(e|es|ing))\b/i.test(a) ? 1 : .25 },
+  // Behavioural rubrics ask how something ENDED, which none of the probes
+  // above covered — a complete story was scored as if it had no resolution.
+  { test: /resolv|ended|outcome|result|how it turned out|conclusion/i, score: (s, a) => starScore(a) >= .5 && /\b(as a result|in the end|we (went with|agreed|decided|shipped)|ended up|the outcome|settled|dropped (from|to)|went from)\b/i.test(a) ? 1 : .3 },
+  { test: /reflect|differently|would do|learn|afterward|changed behaviour|changed behavior/i, score: (s, a) => /\b(I learned|next time|I'?d do|looking back|since then|taught me|what I'?d change|now I)\b/i.test(a) ? 1 : .25 },
+  { test: /deflect|blame|owns the failure|without deflect/i, score: (s, a) => /\b(my (mistake|fault|call)|I got it wrong|I misjudged|I should have|that was on me)\b/i.test(a) ? 1 : (/\b(they|he|she|the team) (didn'?t|failed|messed)/i.test(a) ? .1 : .45) },
 ];
+/* STAR structure — what a behavioural answer is actually judged on.
+   Without this, a complete, well-told story scored on raw word count and came
+   out as VAGUE, because none of the vocabulary probes above fire on rubric
+   wording like "how it was resolved". Narrative structure is a measurable
+   thing; measuring it is the difference between grading a story and counting
+   its words. */
+function starSignals(a) {
+  const s = String(a || "");
+  return {
+    situation: /\b(at|during|when|while|in my|we were|the team was|last (year|semester|month|sprint)|on (my|the) (internship|project))\b/i.test(s),
+    task: /\b(I had to|my job|I was responsible|needed to|the goal|asked me|I wanted to|I decided|it was on me|my part)\b/i.test(s),
+    action: /\b(I (built|wrote|designed|implemented|led|owned|fixed|added|profiled|measured|proposed|chose|migrated|tested|refactored|investigated|rewrote|set up|compared|raised|flagged|asked|told))\b/i.test(s),
+    result: /\b(as a result|which (meant|led|reduced|improved)|we (went with|shipped|reduced|improved|agreed|decided)|in the end|ended up|the outcome|dropped (from|to)|went from|settled it)\b/i.test(s),
+    learning: /\b(I learned|next time|I'?d do|looking back|since then|taught me|takeaway|what I'?d change)\b/i.test(s),
+  };
+}
+const starScore = a => {
+  const st = starSignals(a);
+  // Situation/task/action/result carry the story; learning is a bonus.
+  const core = [st.situation, st.task, st.action, st.result].filter(Boolean).length / 4;
+  return T.clamp(core + (st.learning ? .15 : 0), 0, 1);
+};
+
 function scoreQualitative(point, answer, sig) {
   const hits = PROBES.filter(p => p.test.test(point));
-  if (!hits.length) return T.clamp(sig.words / 90, 0, 1) * .6 + T.clamp(sig.discourse / 3, 0, 1) * .4;
+  if (!hits.length) {
+    // No vocabulary probe fits this rubric point. If the answer reads as a
+    // narrative, grade the narrative; otherwise fall back to shape.
+    const star = starScore(answer);
+    const shape = T.clamp(sig.words / 90, 0, 1) * .6 + T.clamp(sig.discourse / 3, 0, 1) * .4;
+    return Math.max(star, shape);
+  }
   return hits.reduce((a, p) => a + T.clamp(p.score(sig, answer), 0, 1), 0) / hits.length;
 }
 
@@ -85,8 +119,20 @@ function analyzeAnswer({ question, text, secs, history = [], claims = [], resume
 
   // 2 · relevance to the question actually asked
   let onTopic;
-  if (question.kind === "behavioral" || question.kind === "intro" || question.kind === "final") {
-    onTopic = T.clamp(cover * .75 + T.clamp(sig.words / 70, 0, 1) * .25, 0, 1);
+  if (question.kind === "intro" || question.kind === "final") {
+    /* "Tell me about yourself" cannot be answered off-topic — whatever the
+       candidate says IS their introduction. Its rubric ("concise", "narrative,
+       not a list") describes qualities, not subject matter, so low coverage
+       means a weak intro, never an irrelevant one. Scoring those rubrics as
+       relevance made a perfectly good introduction read as OFF_TOPIC and
+       triggered a redirect on the opening turn. */
+    onTopic = T.clamp(.6 + cover * .4, 0, 1);
+  } else if (question.kind === "behavioral") {
+    /* Same reasoning, with one real way to miss: a behavioural question asks
+       for something that happened to *them*. An answer with no first-person
+       account isn't a weak story, it's not a story. */
+    const firstPerson = /\bI\b|\bmy\b|\bwe\b/.test(answer);
+    onTopic = firstPerson ? T.clamp(.5 + cover * .5, 0, 1) : T.clamp(cover * .4, 0, 1);
   } else {
     const qTok = domainTokens(question.text || "");
     const topicTok = domainTokens((question.topicText || "") + " " + rubric.join(" "));

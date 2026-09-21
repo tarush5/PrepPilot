@@ -1,18 +1,15 @@
 {
   "name": "preppilot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "PrepPilot — AI Interview Coach & ATS Analyzer",
   "main": "server.js",
+  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "test": "node server/test/run.js"
   },
-  "keywords": [
-    "interview",
-    "ai",
-    "ats",
-    "coaching"
-  ],
+  "keywords": ["interview", "ai", "ats", "coaching", "rag", "llm"],
   "author": "",
   "license": "MIT",
   "dependencies": {

@@ -13,8 +13,21 @@ const { decide, advance, firstQuestion, planStages, buildTopicQueue, STAGES, STA
 const { Voice, PERSONALITIES, normalizePersonality, Q } = require("./responder");
 const { coveredBy } = require("../projects");
 const { clamp, trimTo, uniq, pick, shortPoint, lc1, uc1 } = require("../text");
+const rag = require("../rag");
+const { buildReport } = require("./report");
+const llm = require("../llm/client");
+const { gradeAnswer } = require("../llm/grade");
+const { humanize } = require("../llm/converse");
+const { rerankTopics } = require("../llm/rerank");
 
 const now = () => Date.now();
+
+/** One spelling for a project/section name, so claims about it group together. */
+const canonCtx = v => {
+  if (!v) return null;
+  const s = String(v).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim().slice(0, 48);
+  return s || null;
+};
 
 /* ---------- creation ---------- */
 function createInterview({ resumeText, jdText, role = "Software Engineer (SDE-1)", personality = "professional", length = 10, type = "mixed", name, mode = "voice" }) {
@@ -50,6 +63,22 @@ function createInterview({ resumeText, jdText, role = "Software Engineer (SDE-1)
     candidate_questions: [], recent_lines: [], final_step: 0, total_budget: total,
     decisions: [],
   };
+
+  /* Per-interview retrieval index over this candidate's own resume. Holds
+     closures, so JSON.stringify drops it automatically when the state is
+     persisted — `rehydrate` rebuilds it from the stored resume text. */
+  Object.defineProperty(state, "_rag", { value: rag.buildResumeIndex(resumeText, resume), writable: true, enumerable: false });
+  Object.defineProperty(state, "_resumeText", { value: String(resumeText || ""), writable: true, enumerable: false });
+  return state;
+}
+
+/** Restore the non-serialisable parts of a state loaded from storage. */
+function rehydrate(state, resumeText) {
+  if (!state._rag) {
+    const text = resumeText || state._resumeText || "";
+    Object.defineProperty(state, "_rag", { value: rag.buildResumeIndex(text, state.resume), writable: true, enumerable: false });
+    Object.defineProperty(state, "_resumeText", { value: text, writable: true, enumerable: false });
+  }
   return state;
 }
 
@@ -209,14 +238,65 @@ function answer(state, text, meta = {}) {
   tick(state);
   const q = state.current_question;
   const v = voiceOf(state);
-  const context = state.thread?.context || state.thread?.key || q.topicId || null;
-  const resumeMetrics = (state.resume.metrics || []).map(m => ({ ...m, context: "resume:" + (state.resume.claims.find(c => c.metrics.includes(m))?.project || "") }));
+  /* Claims are only comparable when both sides name the same subject, so
+     resume metrics and spoken claims have to land in ONE namespace. They used
+     to be keyed differently ("resume:ChurnGuard" vs a topic id), which meant a
+     resume figure and a spoken figure could never match — cross-examination
+     against the resume silently never fired. Both are now canonicalised to the
+     project or section the retrieval index attributes them to. */
+  const ragCtx = state._rag ? state._rag.contextFor(text) : null;
+  const context = canonCtx(ragCtx) || canonCtx(state.thread?.context || state.thread?.key) || q.topicId || null;
+  const resumeMetrics = (state.resume.metrics || []).map(m => {
+    const owner = state._rag ? (state._rag.search(m.quote || "", 1)[0]?.meta?.project || null) : null;
+    return { ...m, context: canonCtx(owner) };
+  });
   const a = analyzeAnswer({
     question: q, text, secs: meta.secs, turn: state.answers.length + 1, context,
     history: state.answers.map(x => ({ text: x.text })), claims: state.previous_claims,
-    resumeMetrics: resumeMetrics.map(m => ({ ...m, context: m.context === "resume:" ? null : m.context })),
+    resumeMetrics,
   });
   a._text = text;
+  a.graded_by = "rules";
+
+  /* An LLM grade, if one was fetched for this turn, is folded in BEFORE the
+     decision is taken — grading after the fact would mean the interviewer
+     reacted to a score it later revised. The blend is deliberate rather than a
+     handover: the model reads substance far better than keyword coverage does,
+     but the rules are better at the things they can actually see (off-topic,
+     too short, filler density, repetition), and keeping both means a bad model
+     response degrades the grade instead of defining it. */
+  if (meta.llmGrade && typeof meta.llmGrade.score === "number") {
+    const g = meta.llmGrade;
+    a.rule_quality = a.answer_quality;
+    a.llm_quality = g.score;
+    a.answer_quality = Math.round(a.answer_quality * 0.4 + g.score * 0.6);
+    a.graded_by = "llm";
+    a.llm_reasoning = g.reasoning || "";
+
+    if (g.errors?.length) {
+      const known = new Set((a.incorrect || []).map(e => e.fix));
+      for (const e of g.errors) if (!known.has(e.correction)) a.incorrect.push({ topic: q.topicId || null, fix: e.correction, probe: null, source: "llm" });
+    }
+    if (g.missing?.length) a.missing_concepts = uniq([...(g.missing || []), ...(a.missing_concepts || [])]).slice(0, 4);
+    if (g.strengths?.length) a.strengths = uniq([...g.strengths, ...(a.strengths || [])]).slice(0, 3);
+    if (g.rubricPoints?.length) {
+      a.hits = g.rubricPoints.filter(p => p.status === "covered").map(p => p.point);
+      a.rubric_detail = g.rubricPoints;
+    }
+    if (g.followUp) a.llm_follow_up = g.followUp;
+
+    // Re-derive the headline category from the blended score so the reaction
+    // the candidate hears matches the grade the report will show.
+    const cats = new Set(a.categories.filter(c => !["STRONG", "CORRECT", "PARTIALLY_CORRECT", "INCOMPLETE", "WEAK"].includes(c)));
+    const qy = a.answer_quality;
+    if (a.primary !== "OFF_TOPIC" && a.primary !== "RAMBLING" && a.primary !== "DONT_KNOW" && a.primary !== "REQUEST") {
+      if (qy >= 8 && !a.incorrect.length) { cats.add("STRONG"); cats.add("CORRECT"); a.primary = "STRONG"; }
+      else if (qy >= 6 && !a.incorrect.length) { cats.add("CORRECT"); a.primary = "CORRECT"; }
+      else if (qy >= 4) { cats.add("PARTIALLY_CORRECT"); a.primary = "PARTIALLY_CORRECT"; }
+      else { cats.add("WEAK"); a.primary = a.incorrect.length ? "INCORRECT" : "WEAK"; }
+      a.categories = [...cats];
+    }
+  }
 
   // 1 · a request, not an answer
   if (a.primary === "REQUEST" && a.intent !== "skip") {
@@ -338,10 +418,86 @@ function conclude(state, v, a, prefix = "") {
   return { utterance: v.compose(prefix, close), question: null, analysis: a, decision: { action: "CONCLUDE", reason: "Interview complete." }, cue: { face: "encouraging", gestures: ["smile", "nod"] }, public: publicView(state), done: true };
 }
 
-/** End early (candidate left, or pressed End). */
+/* ---------- the enriched turn ----------
+   `answer()` above stays synchronous, deterministic and fully self-sufficient:
+   it is what runs with no API key, what the tests exercise, and what the client
+   falls back to. `answerAsync` is the same turn with retrieval and the model
+   layered on — retrieve grounding, grade against it, let that grade inform the
+   decision, then re-voice the resulting line. Every one of those steps is
+   allowed to fail independently, and each failure just drops back to the
+   deterministic result for that step alone. */
+async function answerAsync(state, text, meta = {}) {
+  if (state.status !== "active") throw Object.assign(new Error("This interview has already finished."), { status: 409 });
+  const q = state.current_question;
+  const useLLM = llm.available() && meta.llm !== false;
+
+  let llmGrade = null;
+  let grounding = null;
+
+  if (q && String(text || "").trim().length > 20) {
+    // Retrieval runs with or without a key — it is what makes the grade
+    // syllabus-grounded rather than free-floating.
+    grounding = rag.groundingFor(q, text, { resumeIndex: state._rag });
+
+    if (useLLM) {
+      // Reranking only matters when we're about to *use* the retrieved topic,
+      // which is when the asked question didn't pin one down itself.
+      if (!q.topicId && grounding.topics.length > 1) {
+        try {
+          const hits = await rerankTopics(text, grounding.topics.map(t => ({
+            id: t.topicId, score: t.score, meta: { subject: t.subject, concept: t.concept },
+          })), { keep: 2 });
+          if (hits?.length) {
+            const top = grounding.topics.find(t => t.topicId === hits[0].id);
+            if (top) { grounding.topics = [top, ...grounding.topics.filter(t => t !== top)]; grounding.rubric = q.rubric?.length ? q.rubric : top.rubric; }
+          }
+        } catch { /* keep BM25 order */ }
+      }
+      llmGrade = await gradeAnswer({
+        question: q, answerText: text, grounding,
+        role: state.candidate_profile.role,
+      });
+    }
+  }
+
+  const turn = answer(state, text, { ...meta, llmGrade });
+  turn.grounding = grounding ? { topics: grounding.topics.map(t => ({ id: t.topicId, concept: t.concept, subject: t.subject })), resume: grounding.resume } : null;
+  turn.graded_by = llmGrade ? "llm" : "rules";
+
+  /* Re-voice the line so the acknowledgement refers to what they actually said
+     rather than drawing from a fixed pool of phrases. The question itself is
+     already decided and is passed through unchanged. */
+  if (useLLM && turn.question && turn.utterance && !turn.hold) {
+    try {
+      const voiced = await humanize({
+        persona: state.personality,
+        candidateName: state.candidate_profile.name,
+        lastAnswer: text,
+        decisionReason: turn.decision?.reason || "",
+        questionText: turn.question.text,
+        stageLabel: STAGE_LABEL[state.current_stage] || "",
+        fallback: turn.utterance,
+        isCorrect: turn.analysis ? !(turn.analysis.incorrect || []).length : null,
+      });
+      if (voiced) {
+        turn.utterance = voiced.utterance;
+        turn.cue = { ...(turn.cue || {}), face: voiced.face || turn.cue?.face || "neutral" };
+        turn.voiced = true;
+      }
+    } catch { /* templated line stands */ }
+  }
+  return turn;
+}
+
+/** End early (candidate left, or pressed End). Returns the full report. */
 function endInterview(state) {
   if (state.status === "active") { state.status = "completed"; state.completed_at = now(); state.ended_early = true; }
-  return publicView(state);
+  return buildReport(state, publicView(state));
+}
+
+/** The report without ending anything — for a completed interview. */
+function report(state) {
+  return buildReport(state, publicView(state));
 }
 
 function pause(state, on) {
@@ -397,4 +553,8 @@ function memorySummary(state, lastN = 3) {
   return lines.join("\n") + (recent.length ? `\n\nRecent exchange:\n${recent.join("\n---\n")}` : "");
 }
 
-module.exports = { createInterview, start, answer, endInterview, pause, publicView, memorySummary, rephrase, hintFor, answerCandidateQuestion };
+module.exports = {
+  createInterview, rehydrate, start, answer, answerAsync,
+  endInterview, report, pause, publicView, memorySummary,
+  rephrase, hintFor, answerCandidateQuestion,
+};

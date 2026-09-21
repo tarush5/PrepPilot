@@ -14,10 +14,41 @@ function loadGraph() {
   const endMark = src.indexOf("   2 · app state");
   if (start < 0 || endMark < 0) throw new Error("knowledge graph markers not found in preppilot.html");
   const code = src.slice(start, src.lastIndexOf("/*", endMark)) + ";({ KG, HR_Q })";
-  const { KG, HR_Q } = vm.runInContext(code, vm.createContext({}), { timeout: 1000 });
+  const out = vm.runInContext(code, vm.createContext({}), { timeout: 1000 });
+  // Objects built inside the sandbox carry that realm's prototypes, so they
+  // fail `deepStrictEqual` and `instanceof` against host values in surprising
+  // ways. Round-trip them into plain host objects — this data is pure JSON.
+  const { KG, HR_Q } = JSON.parse(JSON.stringify(out));
   return { KG, HR_Q };
 }
-const { KG, HR_Q } = loadGraph();
+
+/* The HTML graph is the shared baseline with the browser engine. If that parse
+   ever fails — someone reformats preppilot.html, or the server is deployed
+   without it — the server must not fail to boot, because the API is supposed to
+   be the optional half of this system. It degrades to the extension corpus. */
+let baseKG = [], baseHR = [];
+try {
+  const g = loadGraph();
+  baseKG = g.KG; baseHR = g.HR_Q;
+} catch (err) {
+  console.warn("knowledge: could not read the graph from preppilot.html (" + err.message + ")");
+  console.warn("knowledge: falling back to the server-side corpus only.");
+}
+
+const EXT_KG = require("./data/knowledge-graph");
+const { HR_Q: EXT_HR, CLOSING } = require("./data/behavioral");
+const EXT_SIGNALS = require("./data/signals");
+
+/** Merge by id — the HTML definition wins so the two engines never disagree. */
+function mergeById(base, ext) {
+  const out = base.slice();
+  const have = new Set(base.map(x => x.id));
+  for (const n of ext) if (!have.has(n.id)) { out.push(n); have.add(n.id); }
+  return out;
+}
+
+const KG = mergeById(baseKG, EXT_KG);
+const HR_Q = mergeById(baseHR, EXT_HR.concat([CLOSING]));
 const NODE = Object.fromEntries(KG.map(n => [n.id, n]));
 
 /* Canonical skills with aliases — the vocabulary for resume/JD matching. */
@@ -182,4 +213,49 @@ const SCENARIOS = {
   default: "Let's consider a production scenario: this is now serving real users and something fails at 2 a.m. What's your first move?",
 };
 
-module.exports = { KG, HR_Q, NODE, SKILLS: skillPattern, SKILL_TOPICS, HOOKS, MISCONCEPTIONS, SCENARIOS };
+/* Extra skill → topic evidence links for the topics added in data/. */
+Object.assign(SKILL_TOPICS, {
+  "SQL": ["db-sql", "db-index", "db-norm", "db-txn", "db-isolation", "db-locking", "db-partition"],
+  "System Design": ["sd-scale", "sd-cache", "sd-api", "sd-queue", "sd-consistency", "sd-ratelimit", "sd-idempotency", "sd-loadbalance", "sd-observability"],
+  "Data Structures & Algorithms": ["dsa-complexity", "dsa-hash", "dsa-trees", "dsa-graph", "dsa-dp", "dsa-sorting", "dsa-heap", "dsa-string", "dsa-twoptr", "dsa-binsearch", "dsa-greedy", "dsa-backtrack", "dsa-union"],
+  "Machine Learning": ["ml-basics", "ml-overfit", "ml-feature", "ml-eval", "ml-leakage", "ml-imbalance", "ml-interpret", "ml-drift"],
+  "Deep Learning": ["dl-nn", "dl-cnn", "dl-nlp", "dl-train", "dl-transformer", "dl-transfer"],
+  "LLMs": ["llm-core", "llm-prompt", "llm-eval", "llm-agents"],
+  "RAG": ["rag-core", "rag-advanced"],
+  "Operating Systems": ["os-process", "os-sync", "os-memory", "os-sched", "os-deadlock", "os-vm"],
+  "Networking": ["cn-tcp", "cn-http", "cn-osi", "cn-tls", "cn-dns"],
+  "Security": ["sec-core", "sec-injection", "sec-secrets"],
+  "AWS": ["cloud-core", "cloud-iac", "cloud-scaling"],
+  "Azure": ["cloud-core", "cloud-iac", "cloud-scaling"],
+  "GCP": ["cloud-core", "cloud-iac", "cloud-scaling"],
+  "Docker": ["cloud-core", "cloud-containers", "ml-deploy"],
+  "Kubernetes": ["cloud-core", "cloud-containers", "cloud-scaling"],
+  "CI/CD": ["se-sdlc", "cloud-iac"],
+  "Testing": ["se-test", "qa-core", "qa-strategy"],
+  "React": ["web-front", "web-perf"],
+  "Node.js": ["web-back", "sd-api"],
+  "JavaScript": ["web-front", "web-back", "web-perf"],
+  "REST APIs": ["sd-api", "cn-http", "web-back", "sd-idempotency", "web-auth"],
+  "Statistics": ["ds-stats", "ds-experiment"],
+  "Spark": ["de-pipe", "de-modelling"],
+  "Kafka": ["sd-queue", "sd-idempotency"],
+  "Redis": ["sd-cache", "sd-ratelimit"],
+  "MLOps": ["ml-deploy", "ml-drift", "cloud-iac"],
+  "Git": ["se-sdlc", "se-review"],
+});
+
+const ALL_HOOKS = HOOKS.concat(EXT_SIGNALS.HOOKS);
+const ALL_MISCONCEPTIONS = MISCONCEPTIONS.concat(EXT_SIGNALS.MISCONCEPTIONS);
+
+module.exports = {
+  KG, HR_Q, NODE, SKILLS: skillPattern, SKILL_TOPICS,
+  HOOKS: ALL_HOOKS, MISCONCEPTIONS: ALL_MISCONCEPTIONS, SCENARIOS,
+  stats: () => ({
+    topics: KG.length, subjects: [...new Set(KG.map(n => n.s))].length,
+    questions: KG.reduce((n, x) => n + (x.q || []).length, 0),
+    rubricPoints: KG.reduce((n, x) => n + (x.rubric || []).length, 0),
+    probes: KG.reduce((n, x) => n + (x.probes || []).length, 0),
+    behavioural: HR_Q.length, hooks: ALL_HOOKS.length, misconceptions: ALL_MISCONCEPTIONS.length,
+    skills: Object.keys(skillPattern).length,
+  }),
+};

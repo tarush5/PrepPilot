@@ -412,6 +412,56 @@ hr.sep{border:0;border-top:1px solid var(--line);margin:22px 0}
 .fix p{font-size:13px;color:var(--text-dim);margin:0}
 .fix .was{font-size:12.5px;background:var(--surface-2);border-radius:9px;padding:8px 11px;margin-top:8px;display:block}
 
+/* ---------- media status ---------- */
+.media-banner{
+  display:none;align-items:flex-start;gap:10px;margin-bottom:10px;
+  border:1px solid var(--amber);border-radius:11px;padding:10px 12px;
+  background:color-mix(in srgb,var(--amber) 10%,transparent);
+  font-size:13px;line-height:1.5;color:var(--text);
+}
+.media-banner.on{display:flex}
+.media-banner .x{
+  margin-left:auto;background:none;border:0;color:var(--text-dim);
+  font-size:18px;line-height:1;cursor:pointer;padding:0 2px;
+}
+.check-list{display:grid;gap:8px;margin-top:10px}
+.check-row{display:flex;align-items:flex-start;gap:9px;font-size:13px;line-height:1.5}
+.check-row .dot{
+  flex:none;width:9px;height:9px;border-radius:50%;margin-top:5px;background:var(--text-dim);
+}
+.check-row.ok   .dot{background:var(--mint)}
+.check-row.bad  .dot{background:var(--amber)}
+.check-row.busy .dot{background:var(--accent);animation:pulseDot 1s ease-in-out infinite}
+@keyframes pulseDot{0%,100%{opacity:1}50%{opacity:.3}}
+.check-row b{font-weight:600;display:block}
+.check-row span{color:var(--text-dim)}
+.check-fix{
+  margin-top:10px;font-size:12.5px;color:var(--text-dim);
+  border-left:2px solid var(--line);padding-left:11px;line-height:1.6;
+}
+.check-fix code{
+  background:var(--surface-2);border-radius:5px;padding:1px 5px;font-size:12px;
+}
+
+/* ---------- which engine is grading ---------- */
+.engine-pill{
+  margin-left:auto;font-size:11px;letter-spacing:.02em;padding:4px 10px;border-radius:999px;
+  border:1px solid var(--line);color:var(--text-dim);background:var(--surface-2);white-space:nowrap;
+}
+.engine-pill.server{border-color:var(--accent);color:var(--accent)}
+.engine-pill.full{border-color:var(--mint);color:var(--mint)}
+
+/* ---------- deep resume review (server + Claude) ---------- */
+.deep{margin-top:18px}
+.deep .rw{border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:10px;background:var(--surface-2)}
+.deep .rw .orig{font-size:12.5px;color:var(--text-dim);text-decoration:line-through;opacity:.75}
+.deep .rw .prob{font-size:12.5px;color:var(--amber);margin:6px 0}
+.deep .rw .new{font-size:13.5px;color:var(--mint);font-weight:500}
+.deep .risk{border-left:3px solid var(--amber);padding-left:12px;font-size:13px;margin:8px 0;color:var(--text-dim)}
+.deep .verdict{font-size:14px;line-height:1.6;margin-bottom:14px}
+.deep .defend{font-size:13px;margin:7px 0;color:var(--text-dim)}
+.deep .defend b{color:var(--text);font-weight:500}
+
 /* ---------- interview room ---------- */
 .room{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:22px;align-items:start}
 @media(max-width:940px){.room{grid-template-columns:1fr}}
@@ -769,7 +819,7 @@ table.kv td:last-child{text-align:right;font-weight:700;font-family:"JetBrains M
         <p class="small muted" style="margin:2px 0 0">Say a sentence so we can confirm your mic and accent are coming through.</p>
       </div>
       <div class="row">
-        <button class="btn ghost sm" id="micTest">Test my mic</button>
+        <button class="btn ghost sm" id="micTest">Check audio &amp; camera</button>
         <button class="btn" id="startBtn" disabled>Analyze resume →</button>
       </div>
     </div>
@@ -2256,6 +2306,9 @@ const PROSODY = {
 
 const TTS = {
   voices: {}, speakingNow: false, _gen: 0, _mouthIv: null, _closeT: null, lastBoundary: 0,
+  /* null = untested, true = audio confirmed, false = engine present but mute.
+     `onDead` is set by the app so a wedged engine degrades the UI once. */
+  healthy: null, onDead: null, _watchdog: null, _keepAlive: null,
 
   /* Edge's "Online (Natural)" voices and Chrome's Google voices are neural and
      sound far more like a person; prefer them, matched to the interviewer. */
@@ -2300,23 +2353,60 @@ const TTS = {
     }, 95);
 
     let finished = false;
+    let started = false;
     const done = () => {
       if (finished || gen !== this._gen) return;
-      finished = true; this.halt(); onEnd?.();
+      finished = true;
+      clearTimeout(this._watchdog);
+      clearInterval(this._keepAlive);
+      this.halt(); onEnd?.();
     };
     parts.forEach((p, i) => {
       const u = new SpeechSynthesisUtterance(p);
       if (voice) u.voice = voice;
       u.rate = clamp(rate * (.985 + Math.random() * .03), .7, 1.3);   // no two sentences quite alike
       u.pitch = clamp(pitch * (.99 + Math.random() * .02), .5, 1.6);
-      u.onboundary = e => { if (gen === this._gen && (e.name === "word" || e.name === undefined)) this.pulse(e.charLength || 5); };
+      u.onstart = () => { started = true; this.healthy = true; };
+      u.onboundary = e => { started = true; if (gen === this._gen && (e.name === "word" || e.name === undefined)) this.pulse(e.charLength || 5); };
       u.onend = () => { if (i === parts.length - 1) done(); else { mouthOpen = 0; faceDirty = true; } };
       u.onerror = done;
       speechSynthesis.speak(u);
     });
-    // safety net: if the engine never fires onend, don't hang the interview
+
+    /* Chrome (and the Electron shells built on it) pauses a long synthesis
+       queue after ~15s of wall time. Nudging resume() keeps it moving. */
+    clearInterval(this._keepAlive);
+    this._keepAlive = setInterval(() => {
+      if (finished || gen !== this._gen) { clearInterval(this._keepAlive); return; }
+      try { if (speechSynthesis.speaking && !speechSynthesis.paused) speechSynthesis.resume(); } catch {}
+    }, 4000);
+
+    /* The watchdog.
+
+       This used to require `!speechSynthesis.speaking` before firing, which
+       made it useless in the exact situation it existed for. In some embedded
+       browsers the synthesis queue wedges: `speaking` latches true forever, no
+       audio plays, and onstart/onend never fire. The guard meant the watchdog
+       saw `speaking === true`, declined to act, and `onEnd` was never called —
+       so `say()` awaited a promise that could not resolve and the interview
+       stopped dead on its first line, with no error and no way forward.
+
+       It now fires unconditionally. Finishing a turn slightly early is a
+       cosmetic problem; never finishing it is a broken product. */
     const est = text.split(/\s+/).length * 430 / rate + 2500;
-    setTimeout(() => { if (!finished && gen === this._gen && !speechSynthesis.speaking) done(); }, est);
+    clearTimeout(this._watchdog);
+    this._watchdog = setTimeout(() => done(), est);
+
+    /* If nothing has started speaking shortly after we asked, the engine is
+       not working. Say so once, and let the app fall back to text. */
+    setTimeout(() => {
+      if (started || finished || gen !== this._gen) return;
+      if (this.healthy !== false) {
+        this.healthy = false;
+        this.onDead?.();
+      }
+      done();                       // never leave the caller waiting
+    }, 1600);
   },
   halt() {
     clearInterval(this._mouthIv); clearTimeout(this._closeT);
@@ -2351,11 +2441,26 @@ const Mic = {
       else Human.clearStall();
     };
     r.onerror = e => {
-      const fatal = ["not-allowed","service-not-allowed","audio-capture","network"];
-      if (fatal.includes(e.error)) { this.live = false; this.stop(); }
-      if (e.error === "not-allowed" || e.error === "service-not-allowed") toast("Mic permission denied — use the text box instead.");
-      else if (e.error === "audio-capture") toast("No mic found — check your device or use text mode.");
-      else if (e.error === "network") toast("Speech service unavailable — use text mode.");
+      const fatal = ["not-allowed", "service-not-allowed", "audio-capture", "network"];
+      if (!fatal.includes(e.error)) return;          // "no-speech" etc. — keep listening
+
+      this.live = false;
+      this.stop(true);
+
+      /* A fatal mic error used to stop the recogniser and say nothing else.
+         The interview was awaiting `onDone` from this callback, so it simply
+         waited forever — the candidate saw a question, a live mic button, and
+         an interviewer that never reacted. Hand control back, permanently
+         switch to typing, and explain which of the four things went wrong. */
+      const why = {
+        "not-allowed": "Microphone permission is blocked.",
+        "service-not-allowed": "This browser blocked the speech service.",
+        "audio-capture": "No microphone was found.",
+        "network": "The speech recognition service is unreachable.",
+      }[e.error];
+      Media.degradeToText(why);
+      const cb = this.onDone; this.onDone = null;
+      cb?.(null);
     };
     r.onend = () => { if (this.live) { try { r.start(); } catch {} } };
     try { r.start(); } catch {}
@@ -2383,6 +2488,146 @@ const Mic = {
     stopWave();
     if (!silent) setMicBtn("idle");
   }
+};
+
+/* ---------------------------------------------------------------
+   Media capabilities — find out what actually works, before we need it
+   ---------------------------------------------------------------
+   The app used to assume voice worked: mode defaulted to "voice", the
+   interview started, and if the microphone was blocked or the speech engine
+   was mute the candidate got a frozen screen with no explanation. Every one of
+   those failures is knowable in advance, so we check up front, say plainly
+   what is and isn't available, and pick a mode that will actually function.
+
+   Four separate things can fail independently, and conflating them is why the
+   old failures were so opaque:
+     · speech synthesis  — the interviewer's voice (needs no permission)
+     · speech recognition — the API existing at all (Chromium only)
+     · microphone        — permission to capture (separate from the above)
+     · camera            — permission for video analysis
+--------------------------------------------------------------- */
+const Media = {
+  caps: { tts: null, sr: null, mic: null, cam: null, checked: false },
+  degraded: false,
+
+  /** Is speech synthesis present AND does it actually emit audio events? */
+  testTTS(timeout = 2200) {
+    return new Promise(resolve => {
+      if (!("speechSynthesis" in window)) return resolve({ ok: false, why: "This browser has no speech synthesis." });
+      let settled = false;
+      const finish = (ok, why) => { if (settled) return; settled = true; try { speechSynthesis.cancel(); } catch {} resolve({ ok, why }); };
+      try {
+        const u = new SpeechSynthesisUtterance("​");          // zero-width: silent probe
+        u.volume = 0;
+        u.onstart = () => finish(true, null);
+        u.onend = () => finish(true, null);
+        u.onerror = e => finish(false, "The speech engine returned an error (" + (e.error || "unknown") + ").");
+        speechSynthesis.speak(u);
+      } catch (e) { return finish(false, "The speech engine could not be started."); }
+      // A wedged queue latches `speaking` true and fires nothing at all.
+      setTimeout(() => finish(false, "The speech engine accepted the request but produced no audio."), timeout);
+    });
+  },
+
+  /** Ask for the microphone. Releases it immediately — this is a probe. */
+  async testMic() {
+    if (!navigator.mediaDevices?.getUserMedia) return { ok: false, why: "This browser cannot capture audio." };
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+      s.getTracks().forEach(t => t.stop());
+      return { ok: true, why: null };
+    } catch (e) {
+      return { ok: false, why: e?.name === "NotAllowedError"
+        ? "Microphone permission is blocked for this page."
+        : e?.name === "NotFoundError" ? "No microphone is connected."
+        : "The microphone could not be opened (" + (e?.name || "unknown") + ")." };
+    }
+  },
+
+  async testCam() {
+    if (!navigator.mediaDevices?.getUserMedia) return { ok: false, why: "This browser cannot capture video." };
+    try {
+      const s = await navigator.mediaDevices.getUserMedia({ video: true });
+      s.getTracks().forEach(t => t.stop());
+      return { ok: true, why: null };
+    } catch (e) {
+      return { ok: false, why: e?.name === "NotAllowedError"
+        ? "Camera permission is blocked for this page."
+        : e?.name === "NotFoundError" ? "No camera is connected."
+        : "The camera could not be opened (" + (e?.name || "unknown") + ")." };
+    }
+  },
+
+  /** Probe everything. `withPermission` triggers the browser prompts. */
+  async probe({ withPermission = false } = {}) {
+    const tts = await this.testTTS();
+    const sr = { ok: !!SR, why: SR ? null : "This browser has no speech recognition. Chrome or Edge is needed for voice answers." };
+
+    let mic = { ok: null, why: "Not checked yet." };
+    let cam = { ok: null, why: "Not checked yet." };
+
+    // Read the permission state without prompting, where the browser allows it.
+    const peek = async name => {
+      try { return (await navigator.permissions.query({ name })).state; } catch { return null; }
+    };
+    const micState = await peek("microphone");
+    const camState = await peek("camera");
+    if (micState === "denied") mic = { ok: false, why: "Microphone permission is blocked for this page." };
+    if (camState === "denied") cam = { ok: false, why: "Camera permission is blocked for this page." };
+
+    if (withPermission) {
+      if (mic.ok !== false) mic = await this.testMic();
+      if (cam.ok !== false && App.video) cam = await this.testCam();
+    }
+
+    TTS.healthy = tts.ok;
+    this.caps = { tts, sr, mic, cam, checked: true };
+    return this.caps;
+  },
+
+  /** Can a voice interview actually work right now? */
+  canDoVoice() {
+    const c = this.caps;
+    return !!(c.sr && c.sr.ok && c.mic && c.mic.ok !== false);
+  },
+
+  /** Switch to typing for the rest of the session and say why, once. */
+  degradeToText(reason) {
+    if (App.mode === "text" && this.degraded) return;
+    const wasVoice = App.mode === "voice";
+    App.mode = "text";
+    this.degraded = true;
+    const sel = $("#modeSel"); if (sel) sel.value = "text";
+    const pill = $("#modePill"); if (pill) pill.textContent = "text";
+    try { Mic.stop(true); } catch {}
+    const box = $("#typeIn");
+    if (box) { box.disabled = false; box.placeholder = "Type your answer…"; setTimeout(() => box.focus(), 80); }
+    this.banner(reason
+      ? `${reason} Switched to typed answers — the interview continues normally.`
+      : "Switched to typed answers — the interview continues normally.");
+    if (wasVoice) toast("Voice unavailable — you can type your answers.");
+  },
+
+  /** A persistent, readable explanation inside the room (not a 3s toast). */
+  banner(text) {
+    let b = $("#mediaBanner");
+    if (!b) {
+      b = el("div");
+      b.id = "mediaBanner";
+      b.className = "media-banner";
+      const log = $("#chatLog");
+      if (log && log.parentNode) log.parentNode.insertBefore(b, log);
+      else return;
+    }
+    b.innerHTML = `<span>${esc(text)}</span><button class="x" aria-label="Dismiss">×</button>`;
+    b.classList.add("on");
+    $(".x", b).onclick = () => b.classList.remove("on");
+  },
+};
+
+/* If the engine wedges mid-interview, fall back rather than mime silently. */
+TTS.onDead = () => {
+  Media.banner("The speech engine on this device isn't producing audio, so the interviewer's questions are shown as text. Everything else works normally.");
 };
 
 /* waveform (driven by the real mic when permission allows) */
@@ -2756,9 +3001,116 @@ Reply with only the question text.`;
   }
 }
 
+/* ---------------------------------------------------------------
+   The optional server
+   ---------------------------------------------------------------
+   PrepPilot runs entirely in this file — that is what lets it be opened
+   from disk or served as a static page with no backend at all, and that
+   property is not negotiable.
+
+   But when it IS served by `npm start`, there is a Node engine behind it with
+   a 94-topic syllabus, BM25 retrieval over that syllabus and the candidate's
+   own resume, and (given an ANTHROPIC_API_KEY) Claude grading each answer
+   against retrieved rubric. That grades substance far better than the
+   keyword-coverage pass below can.
+
+   So: probe once at boot, use it when it answers, and fall back silently the
+   moment it doesn't. Every call has a short timeout — a slow server must never
+   stall a live interview.
+--------------------------------------------------------------- */
+const Backend = {
+  ready: false, llm: false, info: null, session: null,
+
+  async probe() {
+    try {
+      const r = await fetch("/api/health", { signal: AbortSignal.timeout(2500) });
+      if (!r.ok) return false;
+      const j = await r.json();
+      if (!j || j.service !== "preppilot") return false;
+      this.ready = true;
+      this.llm = !!(j.llm && j.llm.available);
+      this.info = j;
+      return true;
+    } catch { return false; }
+  },
+
+  async post(path, body, ms = 30000) {
+    if (!this.ready) return null;
+    try {
+      const r = await fetch(path, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(ms),
+      });
+      const j = await r.json();
+      return j && j.ok ? j : null;
+    } catch { return null; }
+  },
+
+  /* Grade one answer. Stateless on purpose: this client picks its own
+     questions, so it must send the question it actually asked rather than let
+     the server assume an ordering. Returns an `ev` in the same shape the local
+     grader produces, or null. */
+  async grade(item, answer, rubric, sig) {
+    if (!this.ready) return null;
+    const j = await this.post("/api/grade", {
+      question: item.q || "",
+      kind: item.kind === "tech" ? "tech" : item.kind === "claim" ? "project" : item.kind,
+      topicId: item.node ? item.node.id : null,
+      rubric, forceQualitative: item.kind !== "tech",
+      answer, role: App.role,
+      secs: sig ? sig.secs : null,
+      turn: App.turns.length + 1,
+      history: App.turns.slice(-6).map(t => t.answer || ""),
+      resumeText: App.resumeText || "",
+    }, 25000);
+    if (!j || !j.grade) return null;
+    const a = j.grade;
+    const to5 = v => clamp(Math.round((Number(v) || 0) / 2), 0, 5);
+    return {
+      correctness: to5(a.technical_accuracy), depth: to5(a.depth),
+      structure: to5(a.clarity), relevance: to5(a.relevance),
+      communication: to5(a.clarity),
+      missing: (a.missing_concepts || []).slice(0, 4).map(String),
+      ideal: "", note: a.reasoning || (a.strengths || [])[0] || "",
+      followup: a.follow_up || null,
+      source: a.graded_by === "llm" ? "server+claude" : "server",
+      retrieved: j.retrieved || [],
+    };
+  },
+
+  async deepResume(resumeText, jdText, atsScore) {
+    if (!this.ready || !this.llm) return null;
+    const j = await this.post("/api/resume/analyze",
+      { resumeText, jdText, role: App.role, atsScore, deep: true }, 60000);
+    return j && j.llm ? j.llm : null;
+  },
+};
+
 async function gradeAnswer(item, answer, sig) {
   const fb = heuristicEval(item, answer, sig, App.turns);
-  if (!App.sample || !answer || answer.split(" ").length < 4) return fb;
+  if (!answer || answer.split(" ").length < 4) return fb;
+
+  /* The server grades against a larger syllabus with retrieval behind it, so
+     prefer it when it's there. Anything it doesn't cover falls through to the
+     offline findings below, which stay authoritative for repetition and
+     off-topic detection — those are things only this client can see. */
+  if (Backend.ready) {
+    const srv = await Backend.grade(item, answer, rubricFor(item), sig);
+    if (srv) {
+      const ev = { ...srv, diag: fb.diag, hits: fb.hits };
+      if (!ev.ideal) ev.ideal = fb.ideal;
+      if (!ev.note) ev.note = fb.note;
+      if (fb.diag.repeated) {
+        ev.relevance = Math.min(ev.relevance, 1);
+        ev.depth = Math.min(ev.depth, 1);
+        ev.correctness = Math.min(ev.correctness, 2);
+        ev.note = fb.note;
+      }
+      return ev;
+    }
+  }
+
+  if (!App.sample) return fb;
 
   const rub = rubricFor(item);
   const prompt = `You are grading one answer from a live interview for a ${App.role} role. Be fair and specific. Never let accent, grammar of non-native English, dialect, name or gender affect any score — grade the substance only.
@@ -3885,9 +4237,15 @@ const Human = {
     if (!App.running) return;
     App.closing = true;
     const asked = this.questions[0];
-    await this.speak(asked
+    const line = asked
       ? `Before we wrap up — earlier you asked: "${trimTo(asked, 90)}". Let me come back to that.`
-      : "Before we wrap up — do you have any questions for me?", "encouraging", "smile");
+      : "Before we wrap up — do you have any questions for me?";
+    /* The question panel is the primary display in voice mode, so it has to
+       follow the closing exchange too. It used to stay frozen on the last
+       technical question while the interviewer moved on, which left a voice
+       candidate reading one question and hearing another. */
+    setQ(line, App.interviewerName || "PrepPilot", "Wrap-up", "");
+    await this.speak(line, "encouraging", "smile");
     const q = asked || await awaitReply({ timeout: App.mode === "voice" ? 14000 : 30000 });
     if (q && !/^(no|nope|nothing|not really|none|i'?m good|that'?s (all|it)|no questions)\b/i.test(q.trim())) {
       await this.speak(await this.answerQuestion(q), "encouraging", "nod");
@@ -4011,6 +4369,21 @@ async function say(text, face = "neutral") {
 }
 
 async function startInterview() {
+  /* Last gate before the room. If voice was chosen but cannot work, say so
+     and switch now — starting a voice interview with a blocked microphone
+     used to leave the candidate staring at a question nothing would ever
+     respond to. */
+  if (App.mode === "voice") {
+    if (!Media.caps.checked) await Media.probe({ withPermission: false });
+    if (!Media.caps.sr.ok) Media.degradeToText(Media.caps.sr.why);
+    else if (Media.caps.mic.ok === false) Media.degradeToText(Media.caps.mic.why);
+    else if (Media.caps.mic.ok == null) {
+      // Permission never asked for. Ask now, while we can still explain it.
+      const mic = await Media.testMic();
+      Media.caps.mic = mic;
+      if (!mic.ok) Media.degradeToText(mic.why);
+    }
+  }
   App.blueprint = buildBlueprint(App.nodes, App.parsed.claims, App.length);
   App.turns = []; App.idx = 0; App.running = true; App.startedAt = Date.now();
   App.candidate = { strong: {}, weak: {}, stress: .3, streakGood: 0, streakBad: 0 };
@@ -4020,6 +4393,10 @@ async function startInterview() {
   $("#chatLog").innerHTML = "";
   $("#modePill").textContent = App.mode;
   $("#directorStrip")?.classList.remove("on");
+  // Re-open the controls a finished interview closed.
+  const typeIn = $("#typeIn");
+  if (typeIn) { typeIn.disabled = false; typeIn.value = ""; typeIn.placeholder = "Type your answer…"; }
+  for (const id of ["#sendBtn", "#micBtn", "#repeatBtn", "#hintBtn", "#skipBtn"]) { const b = $(id); if (b) b.disabled = false; }
   setProgress();
   go("room");
   Video.reset();
@@ -4181,6 +4558,12 @@ async function finishInterview() {
   App.running = false;
   Mic.stop(); TTS.stop();
   Video.sealSegment();
+  /* Close the composer with the interview. It used to stay enabled and
+     silently swallow anything typed after the last question. */
+  const typeIn = $("#typeIn"), sendBtn = $("#sendBtn");
+  if (typeIn) { typeIn.disabled = true; typeIn.value = ""; typeIn.placeholder = "Interview finished — your report is ready."; }
+  if (sendBtn) sendBtn.disabled = true;
+  for (const id of ["#micBtn", "#repeatBtn", "#hintBtn", "#skipBtn"]) { const b = $(id); if (b) b.disabled = true; }
   if (!App.turns.length) {
     await Video.stop(); Video.reset();
     toast("No answers recorded — nothing to report on yet.");
@@ -4767,6 +5150,64 @@ function renderLab() {
   $("#claimList").innerHTML = p.claims.length
     ? p.claims.slice(0, 5).map(c => `<div class="fix" style="border-color:var(--accent)"><p>${esc(c.slice(0, 165))}</p></div>`).join("")
     : `<p class="muted small">No detailed project bullets found. Add 2–3 bullets per project describing what you personally built — that's what a real interviewer digs into.</p>`;
+
+  renderDeepReview();
+}
+
+/* The structural ATS score above is rules: parseability, sections, links,
+   metric density, keyword overlap. Those are the right tool for mechanical
+   checks and they run instantly with no server.
+
+   What rules cannot do is read "worked on the backend team to improve system
+   performance" and tell you it says nothing. That needs judgement, so it only
+   appears when a server with an API key is actually there — and it arrives
+   asynchronously, because the candidate should be reading their score, not
+   waiting on a network call. */
+async function renderDeepReview() {
+  const host = $("#deepReview") || (() => {
+    const d = el("div");
+    d.id = "deepReview";
+    d.className = "deep";
+    $("#fixList").after(d);
+    return d;
+  })();
+
+  if (!Backend.ready || !Backend.llm) { host.innerHTML = ""; return; }
+
+  host.innerHTML = `<h3 class="sec-h">Deeper review</h3><p class="muted small">Reading your bullets…</p>`;
+  const r = await Backend.deepResume(App.resumeText, App.jd, App.ats ? App.ats.total : null);
+  if (!r) { host.innerHTML = ""; return; }
+
+  const part = [];
+  part.push(`<h3 class="sec-h">Deeper review</h3>`);
+  if (r.verdict) part.push(`<p class="verdict">${esc(r.verdict)}</p>`);
+  if (r.strongestBullet) part.push(`<div class="fix good"><h4>Your strongest line</h4><p>${esc(r.strongestBullet)}</p></div>`);
+
+  if (r.weakBullets && r.weakBullets.length) {
+    part.push(`<h4 class="sec-h" style="margin-top:16px">Bullets to rewrite</h4>`);
+    for (const b of r.weakBullets) {
+      part.push(`<div class="rw">
+        <div class="orig">${esc(b.original)}</div>
+        <div class="prob">${esc(b.problem)}</div>
+        <div class="new">${esc(b.rewrite)}</div>
+      </div>`);
+    }
+  }
+  if (r.credibilityRisks && r.credibilityRisks.length) {
+    part.push(`<h4 class="sec-h" style="margin-top:16px">We'll push on these</h4>`);
+    for (const c of r.credibilityRisks) part.push(`<div class="risk">${esc(c)}</div>`);
+  }
+  if (r.claimsToDefend && r.claimsToDefend.length) {
+    part.push(`<h4 class="sec-h" style="margin-top:16px">Be ready to defend</h4>`);
+    for (const c of r.claimsToDefend) {
+      part.push(`<div class="defend"><b>${esc(c.claim)}</b><br>→ “${esc(c.likely_question)}”</div>`);
+    }
+  }
+  if (r.missingForRole && r.missingForRole.length) {
+    part.push(`<h4 class="sec-h" style="margin-top:16px">Missing for this role</h4>`);
+    part.push(`<p class="muted small">${r.missingForRole.map(esc).join(" · ")}</p>`);
+  }
+  host.innerHTML = part.join("");
 }
 
 function drawResume() {
@@ -4909,37 +5350,121 @@ $$("#persona .opt").forEach(b => b.onclick = () => {
   App.persona = b.dataset.v;
 });
 $("#roleSel").onchange = e => App.role = e.target.value;
-$("#videoToggle").onclick = e => {
+$("#videoToggle").onclick = async e => {
   const btn = e.currentTarget;
   const on = btn.getAttribute("aria-checked") !== "true";
-  if (on && !navigator.mediaDevices?.getUserMedia) return toast("This browser can't access a camera.");
-  btn.setAttribute("aria-checked", String(on));
-  App.video = on;
-  store.set("video", on);
+  if (!on) { btn.setAttribute("aria-checked", "false"); App.video = false; store.set("video", false); return; }
+
+  /* Ask for the camera here rather than at the start of the interview. The
+     toggle used to flip on regardless, and the candidate only discovered the
+     camera was blocked once the interview had already begun — at which point
+     the tile sat black and the toast had long gone. */
+  const cam = await Media.testCam();
+  Media.caps.cam = cam;
+  if (!cam.ok) {
+    btn.setAttribute("aria-checked", "false");
+    App.video = false; store.set("video", false);
+    $("#micOut").innerHTML =
+      `<div class="check-fix"><b>Video analysis stays off.</b> ${esc(cam.why)}
+       Allow the camera from the padlock icon in the address bar and try again, or leave it off — it only adds posture and eye-contact notes to the report.</div>`;
+    toast("Camera unavailable — video analysis stays off.");
+    return;
+  }
+  btn.setAttribute("aria-checked", "true");
+  App.video = true;
+  store.set("video", true);
 };
 if (store.get("video", false)) $("#videoToggle").click();
 $("#lenSel").onchange = e => App.length = clamp(+e.target.value || 10, 3, 20);
-$("#modeSel").onchange = e => {
+$("#modeSel").onchange = async e => {
   App.mode = e.target.value;
-  if (App.mode === "voice" && !Mic.supported) { toast("Speech recognition isn't supported in this browser — text mode it is."); App.mode = "text"; e.target.value = "text"; }
+  if (App.mode !== "voice") { Media.degraded = false; return; }
+
+  /* Choosing voice is a request to actually use the microphone, so resolve it
+     now — here, where there's room to explain — rather than at the first
+     question. */
+  if (!Mic.supported) {
+    toast("Speech recognition isn't supported in this browser — text mode it is.");
+    App.mode = "text"; e.target.value = "text";
+    return;
+  }
+  const mic = Media.caps.mic?.ok ? Media.caps.mic : await Media.testMic();
+  Media.caps.mic = mic;
+  if (!mic.ok) {
+    App.mode = "text"; e.target.value = "text";
+    $("#micOut").innerHTML =
+      `<div class="check-fix"><b>Staying in text mode.</b> ${esc(mic.why)}
+       Fix it from the padlock icon in the address bar and pick Voice again, or carry on typing — the interview and the report are identical.</div>`;
+    toast("Microphone unavailable — staying in text mode.");
+  } else if (!Media.caps.tts?.ok) {
+    $("#micOut").innerHTML =
+      `<div class="check-fix"><b>You can speak your answers, but you won't hear the interviewer.</b>
+       ${esc(Media.caps.tts?.why || "Speech output isn't working on this device.")} Questions will be shown as text.</div>`;
+  }
 };
 if (!Mic.supported) { $("#modeSel").value = "text"; App.mode = "text"; }
 
 /* mic test */
 let micTestTimer = null;
-$("#micTest").onclick = () => {
-  if (!Mic.supported) return $("#micOut").innerHTML = `<span style="color:var(--amber)">This browser doesn't support speech recognition. Chrome or Edge will work; otherwise use text mode.</span>`;
+/* Render the four capabilities as their own rows. Each one can fail for its
+   own reason, and the candidate needs to know which — "voice doesn't work" is
+   not actionable; "camera permission is blocked for this page" is. */
+function renderChecks(caps, { listening = false, heard = null } = {}) {
+  const row = (state, title, detail) =>
+    `<div class="check-row ${state}"><i class="dot"></i><div><b>${esc(title)}</b><span>${esc(detail)}</span></div></div>`;
+  const st = c => (c == null || c.ok == null ? "busy" : c.ok ? "ok" : "bad");
+
+  const parts = [
+    row(st(caps.tts), "Interviewer's voice",
+      caps.tts?.ok ? "Working — you'll hear the questions read aloud." : (caps.tts?.why || "Checking…")),
+    row(st(caps.sr), "Speech recognition",
+      caps.sr?.ok ? "Available in this browser." : (caps.sr?.why || "Checking…")),
+    row(listening ? "busy" : heard != null ? (heard ? "ok" : "bad") : st(caps.mic), "Microphone",
+      listening ? "Listening — say something now."
+        : heard ? `Heard you: “${heard}”`
+        : heard === false ? "Nothing came through. Check the mic permission, then try again."
+        : caps.mic?.ok ? "Permission granted." : (caps.mic?.why || "Not checked yet.")),
+    row(st(caps.cam), "Camera",
+      caps.cam?.ok ? "Permission granted — video analysis will run."
+        : (caps.cam?.why || (App.video ? "Not checked yet." : "Off — turn on video analysis to use it."))),
+  ];
+
+  const broken = [caps.tts, caps.sr, caps.mic, caps.cam].some(c => c && c.ok === false);
+  let fix = "";
+  if (broken) {
+    fix = `<div class="check-fix">
+      <b>To fix permissions:</b> click the padlock (or camera) icon in the address bar and set Microphone and Camera to <b>Allow</b>, then reload.
+      Some embedded browsers block capture entirely — if so, open <code>http://localhost:3000</code> in Chrome or Edge directly.
+      <br><br>You can run the whole interview in <b>Text only</b> mode regardless: every question, the adaptive difficulty and the full report work exactly the same.
+    </div>`;
+  }
+  $("#micOut").innerHTML = `<div class="check-list">${parts.join("")}</div>${fix}`;
+}
+
+$("#micTest").onclick = async () => {
   clearTimeout(micTestTimer);
   Mic.stop(true);
-  $("#micOut").innerHTML = `<span class="spin"></span> Listening — say something.`;
+  renderChecks({ tts: null, sr: null, mic: null, cam: null });
+
+  // This is the one place we're allowed to prompt — the user asked for a check.
+  const caps = await Media.probe({ withPermission: true });
+  renderChecks(caps);
+
+  if (!Media.canDoVoice()) {
+    Media.degradeToText(null);
+    return;
+  }
+
+  // Permission is there, so prove capture actually produces words.
+  renderChecks(caps, { listening: true });
   Mic.start(res => {
-    const text = res?.text || "";
-    if (!text.trim()) {
-      $("#micOut").innerHTML = `<span style="color:var(--amber)">Nothing came through. Check the mic permission in your browser's address bar.</span>`;
-      return;
+    const text = (res?.text || "").trim();
+    renderChecks(caps, { heard: text || false });
+    if (text) {
+      const sig = analyseSpeech(text, res?.secs || 1);
+      $("#micOut").insertAdjacentHTML("beforeend",
+        `<div class="check-fix">Speaking pace on that sample: <b>${sig.wpm} wpm</b>. Anything from 120–160 reads as natural.</div>`);
     }
-    const sig = analyseSpeech(text, res?.secs || 1);
-    $("#micOut").innerHTML = `<span class="pill good">✓ heard you</span> <span class="mono">"${esc(text)}"</span> <span class="muted">· ${sig.wpm} wpm</span>`;
   }, { silence: 1800 });
   micTestTimer = setTimeout(() => Mic.live && Mic.finish(), 9000);
 };
@@ -5100,6 +5625,63 @@ buildWave();
 setFace("neutral");
 renderDash();
 revealIn($("#s-onboard"));
+
+/* Find out what this device can actually do before the candidate commits to a
+   mode. This pass never prompts for permission — it only reads what the
+   browser will tell us for free — so it can run silently at boot. The button
+   in Setup does the prompting version. */
+(async () => {
+  const caps = await Media.probe({ withPermission: false });
+  const voiceImpossible = !caps.sr.ok || caps.mic.ok === false || !caps.tts.ok;
+  if (voiceImpossible && App.mode === "voice") {
+    App.mode = "text";
+    const sel = $("#modeSel");
+    if (sel) {
+      sel.value = "text";
+      const opt = sel.querySelector('option[value="voice"]');
+      if (opt) opt.textContent = "Voice (unavailable on this device)";
+    }
+    const reason = !caps.sr.ok ? caps.sr.why
+      : caps.mic.ok === false ? caps.mic.why
+      : caps.tts.why;
+    /* A blocked permission and a wedged speech engine together almost always
+       mean this page is running inside an embedded webview (a desktop app's
+       preview pane, an in-app browser) that refuses capture outright. No
+       amount of clicking in this page will fix that, so say the one thing
+       that will. */
+    const embedded = caps.mic.ok === false && !caps.tts.ok;
+    $("#micOut").innerHTML =
+      `<div class="check-fix"><b>Text mode selected automatically.</b> ${esc(reason || "Voice isn't available here.")}
+       ${embedded
+         ? `This looks like an embedded browser, which blocks the microphone and camera no matter what you allow.
+            For the spoken interview, open <code>${esc(location.origin)}</code> in Chrome or Edge directly.`
+         : `Press <b>Check audio &amp; camera</b> to grant permission and retest.`}
+       <br><br>Typed mode runs the identical interview — same questions, same adaptive difficulty, same report.</div>`;
+  }
+  if (App.video && caps.cam.ok === false) {
+    App.video = false;
+    const t = $("#videoToggle");
+    if (t) { t.setAttribute("aria-checked", "false"); t.classList.remove("on"); }
+  }
+})();
+
+/* Ask once whether a server is behind this page, and say plainly which engine
+   is grading. A candidate comparing two sessions deserves to know whether the
+   scores came from the same place. */
+(async () => {
+  const ok = await Backend.probe();
+  const pill = el("span");
+  pill.id = "enginePill";
+  pill.className = "engine-pill" + (ok ? (Backend.llm ? " full" : " server") : "");
+  pill.textContent = ok ? (Backend.llm ? "Server engine · Claude" : "Server engine") : "Browser engine";
+  pill.title = ok
+    ? `Answers are graded by the PrepPilot server: ${Backend.info.corpus.topics} topics, `
+      + `${Backend.info.corpus.rubricPoints} rubric points, BM25 retrieval`
+      + (Backend.llm ? `, and ${Backend.info.llm.model} grading each answer.` : `. Set ANTHROPIC_API_KEY on the server to add Claude grading.`)
+    : "Running entirely in this browser. Start the server with `npm start` for the larger syllabus, retrieval and Claude grading.";
+  $("#nav").appendChild(pill);
+  if (ok) console.info("PrepPilot: server engine available", Backend.info.corpus);
+})();
 (window.requestIdleCallback || (f => setTimeout(f, 250)))(() => Robot.init(), { timeout: 1500 });
 window.addEventListener("beforeunload", e => { if (App.running) { e.preventDefault(); e.returnValue = ""; } });
 /* Never leave the camera or mic light on behind a closed tab. */

@@ -108,6 +108,17 @@ function decide(state, a) {
   const followUp = (text, extra = {}) => ({ text, kind: cq.kind === "intro" ? "resume" : cq.kind, rubric: extra.rubric || cq.rubric,
     topicText: cq.topicText, topicId: cq.topicId, followUp: true, stage, ...extra });
 
+  /* How many of the immediately preceding turns took the same corrective
+     action. Every follow-up is issued as a *new* question with a new id, so a
+     guard keyed on `cq.id` resets itself on each loop and never fires — the
+     streak has to be read off the decision log instead. Without this, one
+     off-topic answer could pin the interview to a single question forever. */
+  const streakOf = action => {
+    let n = 0;
+    for (let i = state.decisions.length - 1; i >= 0 && state.decisions[i].action === action; i--) n++;
+    return n;
+  };
+
   // 0 · the clock always wins
   if (state.time_remaining <= 0 && stage !== "final_questions") return advance(state, "Time is up — moving to wrap-up.", "final_questions");
 
@@ -116,13 +127,21 @@ function decide(state, a) {
   if (con) return decision("CHALLENGE", `Candidate contradicted an earlier statement (${con.key}).`,
     followUp(con.say, { challengeKey: con.key + ":" + (con.now.context || ""), rubric: ["Explains the discrepancy clearly", "Gives the accurate figure and context"], forceQualitative: true }));
 
-  // 2 · off-topic, evasive or rambling: bring them back — once per question
-  if ((a.primary === "OFF_TOPIC" || a.primary === "RAMBLING") && !state.redirected.includes(cq.id))
-    return decision("REDIRECT", a.primary === "RAMBLING" ? "Answer ran long without landing." : "Answer didn't address the question.",
-      followUp(Q.redirectCore(cq.text), { redirectOf: cq.id, redirect: true }));
+  // 2 · off-topic, evasive or rambling: bring them back — but only once.
+  //     If the restated question doesn't land either, pressing a third time
+  //     teaches the candidate nothing; a real interviewer moves on.
+  if (a.primary === "OFF_TOPIC" || a.primary === "RAMBLING") {
+    if (streakOf("REDIRECT") >= 1)
+      return advance(state, "Redirected once and it still didn't land — moving on rather than labouring it.");
+    if (!state.redirected.includes(cq.id))
+      return decision("REDIRECT", a.primary === "RAMBLING" ? "Answer ran long without landing." : "Answer didn't address the question.",
+        followUp(Q.redirectCore(cq.text), { redirectOf: cq.id, redirect: true }));
+  }
 
-  // 3 · something wrong: diagnose the misunderstanding, and plan to revisit later
-  if (a.incorrect?.length && room) {
+  // 3 · something wrong: diagnose the misunderstanding, and plan to revisit later.
+  //     Two diagnostics back to back is already an interrogation; stop there and
+  //     let the report carry the gap instead of grinding on it live.
+  if (a.incorrect?.length && room && streakOf("DIAGNOSE") < 2) {
     const m = a.incorrect[0];
     return decision("DIAGNOSE", `Incorrect statement: ${m.fix}`, followUp(m.probe, { rubric: [m.fix], revisitTopic: m.topic || cq.topicId }));
   }
